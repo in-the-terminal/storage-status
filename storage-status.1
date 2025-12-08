@@ -1,4 +1,4 @@
-.TH STORAGE-STATUS 1 "2025-12-07" "storage-status" "User Commands"
+.TH STORAGE-STATUS 1 "2025-12-08" "storage-status" "User Commands"
 .SH NAME
 storage-status \- terminal dashboard for Ubuntu/ZFS storage servers
 .SH SYNOPSIS
@@ -84,10 +84,73 @@ Toggleable panel showing either SMB connections (user and machine) or NFS connec
 Required for remote mode. SSH host or alias for the storage server.
 .TP
 .B STORAGE_HOSTNAME
-Optional. Hostname of the storage server for local detection.
+Optional. Hostname of the storage server for local detection. Compared against the output of
+.BR hostname (1).
 .TP
 .B STORAGE_IPS
-Optional. Comma-separated list of storage server IPs for local detection.
+Optional. Comma-separated list of storage server IPs for local detection. Compared against
+the output of
+.BR "hostname -I" .
+.SH CONFIGURATION
+.SS Auto-Detection Algorithm
+The tool determines execution mode as follows:
+.RS
+.IP 1. 3
+Compare the current hostname to \fBSTORAGE_HOSTNAME\fR
+.IP 2. 3
+If no match, compare local IP addresses (from \fBhostname -I\fR) to \fBSTORAGE_IPS\fR
+.IP 3. 3
+If either matches, run in local mode; otherwise use SSH to \fBSTORAGE_SSH_HOST\fR
+.RE
+.PP
+Use \fB\-\-local\fR or \fB\-\-remote\fR to override detection.
+.SS SSH Setup
+For non-interactive operation, configure SSH key authentication.
+Choose based on your security requirements.
+.PP
+\fBStandard key with passphrase (recommended):\fR
+.RS
+.nf
+ssh-keygen -t ed25519
+eval "$(ssh-agent -s)" && ssh-add
+ssh-copy-id user@storage-server
+.fi
+.RE
+.PP
+\fBHardware security key (FIDO2/YubiKey):\fR
+.RS
+.nf
+ssh-keygen -t ed25519-sk
+ssh-copy-id user@storage-server
+.fi
+.RE
+.PP
+Optionally add a host alias in \fI~/.ssh/config\fR:
+.RS
+.nf
+Host storage-server
+    HostName 10.0.0.10
+    User admin
+.fi
+.RE
+.SS Connection Multiplexing
+The tool automatically uses SSH ControlMaster to reuse a single TCP connection
+for all commands, significantly improving performance in remote mode.
+The connection persists for 60 seconds after the last command.
+.SS Required Permissions
+The SSH user on the storage server needs access to:
+.RS
+.IP \(bu 2
+\fBzpool\fR, \fBzfs\fR \- ZFS status commands
+.IP \(bu 2
+\fBsystemctl\fR \- Service status (read-only)
+.IP \(bu 2
+\fBsmbstatus\fR \- May require membership in \fBsambashare\fR group
+.IP \(bu 2
+\fB/proc/loadavg\fR, \fB/proc/meminfo\fR \- System stats (world-readable)
+.IP \(bu 2
+\fBss\fR \- Socket statistics for NFS connections
+.RE
 .SH EXAMPLES
 .TP
 .B storage-status
@@ -112,6 +175,32 @@ Success
 .TP
 .B 1
 Error (missing environment variables, SSH failure, etc.)
+.SH TROUBLESHOOTING
+.TP
+.B Detection not working
+Verify environment variables match your system:
+.RS
+.nf
+hostname              # Should match STORAGE_HOSTNAME
+hostname -I           # Should include IP from STORAGE_IPS
+.fi
+.RE
+.TP
+.B SSH connection fails
+Test SSH independently with verbose output:
+.RS
+.nf
+ssh -v $STORAGE_SSH_HOST hostname
+.fi
+.RE
+.TP
+.B Permission denied on smbstatus
+Add the SSH user to the sambashare group on the storage server:
+.RS
+.nf
+sudo usermod -aG sambashare $USER
+.fi
+.RE
 .SH SEE ALSO
 .BR zpool (8),
 .BR zfs (8),

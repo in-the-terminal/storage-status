@@ -11,7 +11,7 @@ Usage:
     storage-status datasets     - Show only ZFS datasets
     storage-status services     - Show only service status
 
-Last Updated On: 2025-12-06
+Last Updated On: 2025-12-08
 """
 
 import argparse
@@ -25,6 +25,7 @@ import select
 import termios
 import tty
 import threading
+import tempfile
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 
@@ -97,6 +98,7 @@ class KeyboardListener:
 class CommandRunner:
     """
     Executes commands either locally or via SSH depending on detection.
+    Uses SSH ControlMaster for connection multiplexing in remote mode.
     """
 
     def __init__(self, force_mode: Optional[str] = None):
@@ -108,6 +110,54 @@ class CommandRunner:
         """
         self.is_local = self._detect_local() if force_mode is None else (force_mode == 'local')
         self.ssh_host = SSH_HOST
+        self._control_path = None
+        self._setup_ssh_multiplexing()
+
+    def _setup_ssh_multiplexing(self) -> None:
+        """
+        Set up SSH ControlMaster socket path for connection reuse.
+        Creates a unique control socket in the temp directory.
+        """
+        if not self.is_local and self.ssh_host:
+            # Create control socket path in temp directory
+            self._control_path = os.path.join(
+                tempfile.gettempdir(),
+                f'storage-status-ssh-{os.getpid()}'
+            )
+
+    def _get_ssh_command(self, command: str) -> List[str]:
+        """
+        Build SSH command with ControlMaster options for multiplexing.
+
+        Args:
+            command: The remote command to execute
+
+        Returns:
+            List of command arguments for subprocess
+        """
+        ssh_cmd = ['ssh']
+        if self._control_path:
+            ssh_cmd.extend([
+                '-o', 'ControlMaster=auto',
+                '-o', f'ControlPath={self._control_path}',
+                '-o', 'ControlPersist=60',
+            ])
+        ssh_cmd.extend([self.ssh_host, command])
+        return ssh_cmd
+
+    def cleanup(self) -> None:
+        """
+        Close the SSH ControlMaster connection if active.
+        """
+        if self._control_path and os.path.exists(self._control_path):
+            try:
+                subprocess.run(
+                    ['ssh', '-O', 'exit', '-o', f'ControlPath={self._control_path}', self.ssh_host],
+                    capture_output=True,
+                    timeout=5
+                )
+            except Exception:
+                pass
 
     def _detect_local(self) -> bool:
         """
@@ -142,6 +192,7 @@ class CommandRunner:
     def run(self, command: str, timeout: int = 30) -> Tuple[bool, str]:
         """
         Run a command either locally or via SSH.
+        SSH commands use ControlMaster for connection multiplexing.
 
         Args:
             command: The command to execute
@@ -161,7 +212,7 @@ class CommandRunner:
                 )
             else:
                 result = subprocess.run(
-                    ['ssh', self.ssh_host, command],
+                    self._get_ssh_command(command),
                     capture_output=True,
                     text=True,
                     timeout=timeout
@@ -994,21 +1045,27 @@ def main():
 
     # Single view mode
     if args.view:
-        if args.view == 'pools':
-            console.print(create_pool_panel(status.get_zpool_status()))
-        elif args.view == 'datasets':
-            console.print(create_dataset_panel(status.get_dataset_usage()))
-        elif args.view == 'services':
-            console.print(create_services_panel(status.get_service_status()))
-        elif args.view == 'network':
-            console.print(create_network_panel(status.get_network_stats()))
-        elif args.view == 'smb':
-            console.print(create_smb_panel(status.get_smb_connections()))
+        try:
+            if args.view == 'pools':
+                console.print(create_pool_panel(status.get_zpool_status()))
+            elif args.view == 'datasets':
+                console.print(create_dataset_panel(status.get_dataset_usage()))
+            elif args.view == 'services':
+                console.print(create_services_panel(status.get_service_status()))
+            elif args.view == 'network':
+                console.print(create_network_panel(status.get_network_stats()))
+            elif args.view == 'smb':
+                console.print(create_smb_panel(status.get_smb_connections()))
+        finally:
+            runner.cleanup()
         return
 
     # Full dashboard mode
     if args.once:
-        console.print(create_dashboard(status, mode))
+        try:
+            console.print(create_dashboard(status, mode))
+        finally:
+            runner.cleanup()
         return
 
     keyboard = KeyboardListener()
@@ -1085,6 +1142,7 @@ def main():
     finally:
         fetch_running = False
         keyboard.stop()
+        runner.cleanup()
         console.print("\n[dim]Dashboard stopped.[/dim]")
 
 

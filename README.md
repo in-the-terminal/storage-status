@@ -2,7 +2,7 @@
 
 Terminal dashboard for monitoring Ubuntu/ZFS storage servers. Displays real-time ZFS pool health, dataset usage, system resources, services, and network information.
 
-Last Updated On: 2025-12-06
+Last Updated On: 2025-12-08
 
 ## Features
 
@@ -74,7 +74,65 @@ The tool automatically detects whether it's running locally on the storage serve
 - **Local mode**: Commands run directly on the system
 - **Remote mode**: Commands run via SSH to the configured storage server
 
-Detection is based on hostname and IP address matching. Use `--local` or `--remote` to override.
+### How Detection Works
+
+1. Compares current hostname to `STORAGE_HOSTNAME`
+2. If no match, compares local IPs (from `hostname -I`) against `STORAGE_IPS`
+3. If either matches → local mode; otherwise → remote mode (requires SSH)
+
+### Example Output
+
+```
+$ storage-status --once
+Storage Status - Mode: remote
+
+$ ssh ubuntu-storage storage-status --once
+Storage Status - Mode: local
+```
+
+Use `--local` or `--remote` to override detection.
+
+## SSH Setup (Remote Mode)
+
+For non-interactive operation, configure SSH key authentication. Choose based on your security requirements:
+
+**Standard key with passphrase (recommended):**
+
+```bash
+ssh-keygen -t ed25519                    # Enter a passphrase when prompted
+eval "$(ssh-agent -s)" && ssh-add        # Cache key for session
+ssh-copy-id user@storage-server
+```
+
+**Hardware security key (FIDO2/YubiKey):**
+
+```bash
+ssh-keygen -t ed25519-sk                 # Requires physical touch per connection
+ssh-copy-id user@storage-server
+```
+
+**SSH config for convenience:**
+
+```
+# ~/.ssh/config
+Host storage-server
+    HostName 10.0.0.10
+    User admin
+```
+
+Test: `ssh storage-server hostname`
+
+**Note:** The tool automatically uses SSH connection multiplexing (ControlMaster) to reuse a single TCP connection for all commands, significantly improving performance in remote mode.
+
+## Required Permissions
+
+The SSH user on the storage server needs access to:
+
+- `zpool`, `zfs` - ZFS status commands
+- `systemctl` - Service status (read-only)
+- `smbstatus` - May require membership in `sambashare` group
+- `/proc/loadavg`, `/proc/meminfo` - System stats (world-readable)
+- `ss` - Socket statistics for NFS connections
 
 ## Configuration
 
@@ -96,6 +154,30 @@ Add these to your `~/.bashrc`, `~/.zshrc`, or shell profile for persistence.
 - Python 3.8+
 - SSH access to storage server (for remote mode)
 - ZFS utilities installed on the storage server
+
+## Troubleshooting
+
+**Detection not working as expected:**
+
+```bash
+# Check what the tool sees
+hostname                    # Compare to STORAGE_HOSTNAME
+hostname -I                 # Compare to STORAGE_IPS
+echo $STORAGE_HOSTNAME $STORAGE_IPS
+```
+
+**SSH connection issues:**
+
+```bash
+ssh -v $STORAGE_SSH_HOST    # Verbose output for debugging
+```
+
+**Permission denied on commands:**
+
+```bash
+# Add user to required groups on storage server
+sudo usermod -aG sambashare $USER
+```
 
 ## License
 
