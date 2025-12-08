@@ -1,0 +1,121 @@
+.TH STORAGE-STATUS 1 "2025-12-07" "storage-status" "User Commands"
+.SH NAME
+storage-status \- terminal dashboard for Ubuntu/ZFS storage servers
+.SH SYNOPSIS
+.B storage-status
+[\fB\-\-remote\fR]
+[\fB\-\-local\fR]
+[\fB\-\-once\fR]
+[\fIview\fR]
+.SH DESCRIPTION
+.B storage-status
+displays a real-time terminal dashboard for monitoring Ubuntu/ZFS storage servers.
+It can run locally on the storage server or remotely via SSH, with automatic detection
+of the execution environment.
+.PP
+The dashboard shows ZFS pool status, dataset usage, system resources, service status,
+network interfaces, and SMB/NFS connections.
+.SH OPTIONS
+.TP
+.BR \-\-remote
+Force remote mode. Connect to the storage server via SSH even if running locally.
+.TP
+.BR \-\-local
+Force local mode. Run commands directly without SSH.
+.TP
+.BR \-\-once
+Display the dashboard once and exit. No live refresh or keyboard interaction.
+.TP
+.IR view
+Show only a specific panel. Valid values:
+.BR pools ", " datasets ", " services ", " network ", " smb .
+.SH KEYBOARD CONTROLS
+When running in live mode (without \fB\-\-once\fR):
+.TP
+.B t
+Toggle between SMB and NFS connections panel.
+.TP
+.B Tab
+Same as \fBt\fR.
+.TP
+.B q
+Quit the dashboard.
+.TP
+.B Ctrl+C
+Quit the dashboard.
+.SH DASHBOARD PANELS
+.SS ZFS Pools
+Displays pool name, size, allocated space, free space, capacity percentage, health status,
+and deduplication ratio. The capacity bar is color-coded:
+.RS
+.IP \(bu 2
+Green: < 75% usage
+.IP \(bu 2
+Yellow: 75-89% usage
+.IP \(bu 2
+Red: >= 90% usage
+.RE
+.SS ZFS Datasets
+Hierarchical view of datasets with used space, available space, and compression ratio.
+Child datasets are indented to show the hierarchy.
+.SS System Resources
+Shows CPU load averages (1/5/15 min), memory usage with a color-coded progress bar,
+and system uptime.
+.SS Services
+Status of critical services: smbd, nfs-server, zfs-import-cache, zfs-mount, ssh.
+.RS
+.IP \(bu 2
+\fB●\fR Running (green): Service is active
+.IP \(bu 2
+\fB✓\fR Completed (green): One-shot service completed successfully
+.IP \(bu 2
+\fB○\fR Stopped (yellow): Service is inactive
+.IP \(bu 2
+\fB✗\fR Failed (red): Service failed
+.RE
+.SS Network Interfaces
+Lists network interfaces with their state (UP/DOWN) and IP addresses.
+.SS SMB/NFS Connections
+Toggleable panel showing either SMB connections (user and machine) or NFS connections
+(client IP addresses). Press \fBt\fR to toggle. The panel title shows counts for both.
+.SH ENVIRONMENT
+.TP
+.B STORAGE_SSH_HOST
+Required for remote mode. SSH host or alias for the storage server.
+.TP
+.B STORAGE_HOSTNAME
+Optional. Hostname of the storage server for local detection.
+.TP
+.B STORAGE_IPS
+Optional. Comma-separated list of storage server IPs for local detection.
+.SH EXAMPLES
+.TP
+.B storage-status
+Start the live dashboard with auto-refresh every 5 seconds.
+.TP
+.B storage-status --once
+Display current status once and exit.
+.TP
+.B storage-status pools
+Show only ZFS pool information.
+.TP
+.B storage-status --remote
+Force SSH connection even if running on the storage server.
+.SH FILES
+.TP
+.I ~/.ssh/config
+SSH configuration file. Define a host alias for cleaner configuration.
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Error (missing environment variables, SSH failure, etc.)
+.SH SEE ALSO
+.BR zpool (8),
+.BR zfs (8),
+.BR systemctl (1),
+.BR smbstatus (1)
+.SH AUTHOR
+Written for the in-the-terminal project.

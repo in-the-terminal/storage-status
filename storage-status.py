@@ -21,6 +21,10 @@ import os
 import re
 import time
 import sys
+import select
+import termios
+import tty
+import threading
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 
@@ -37,6 +41,57 @@ from rich import box
 STORAGE_SERVER_HOSTNAME = os.environ.get('STORAGE_HOSTNAME')
 STORAGE_SERVER_IPS = os.environ.get('STORAGE_IPS', '').split(',') if os.environ.get('STORAGE_IPS') else []
 SSH_HOST = os.environ.get('STORAGE_SSH_HOST')
+
+
+class KeyboardListener:
+    """
+    Background thread keyboard listener for terminal applications.
+    """
+
+    def __init__(self):
+        """Initialize keyboard listener."""
+        self.old_settings = None
+        self.running = False
+        self.thread = None
+        self.last_key = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        """Start listening for keyboard input in background thread."""
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        self.running = True
+        self.thread = threading.Thread(target=self._listen, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Stop listening and restore terminal settings."""
+        self.running = False
+        if self.old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+    def _listen(self):
+        """Background thread that listens for keypresses."""
+        while self.running:
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                try:
+                    key = sys.stdin.read(1)
+                    with self.lock:
+                        self.last_key = key
+                except Exception:
+                    pass
+
+    def get_key(self) -> Optional[str]:
+        """
+        Get the last key pressed and clear it.
+
+        Returns:
+            The last key pressed, or None if no key was pressed
+        """
+        with self.lock:
+            key = self.last_key
+            self.last_key = None
+            return key
 
 
 class CommandRunner:
@@ -402,6 +457,31 @@ class StorageStatus:
 
         return {'connections': connections}
 
+    def get_nfs_connections(self) -> Dict[str, Any]:
+        """
+        Get active NFS connections by checking established connections on port 2049.
+
+        Returns:
+            Dictionary with NFS connection information
+        """
+        connections = []
+
+        # Get established TCP connections on NFS port (2049)
+        success, output = self.runner.run(
+            "ss -tn state established '( sport = :2049 )' 2>/dev/null | tail -n +2"
+        )
+        if success and output.strip():
+            for line in output.strip().split('\n'):
+                if line.strip():
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        # Peer address is in format ip:port
+                        peer = parts[3]
+                        ip = peer.rsplit(':', 1)[0] if ':' in peer else peer
+                        connections.append({'ip': ip})
+
+        return {'connections': connections}
+
 
 def create_pool_panel(pool_data: Dict[str, Any]) -> Panel:
     """
@@ -628,30 +708,118 @@ def create_smb_panel(smb_data: Dict[str, Any]) -> Panel:
 
     return Panel(
         content,
-        title=f"[bold blue]SMB Connections ({len(connections)})[/bold blue]",
+        title=f"[bold blue]SMB ({len(connections)})[/bold blue]",
         box=box.ROUNDED,
         padding=(0, 1)
     )
 
 
-def create_dashboard(status: StorageStatus, mode: str) -> Layout:
+def create_nfs_panel(nfs_data: Dict[str, Any]) -> Panel:
     """
-    Create the full dashboard layout.
+    Create a panel showing NFS connections.
 
     Args:
-        status: StorageStatus instance
+        nfs_data: NFS connection information
+
+    Returns:
+        Rich Panel with NFS connections
+    """
+    connections = nfs_data.get('connections', [])
+
+    if not connections:
+        content = Text("No active connections", style="dim")
+    else:
+        table = Table(box=None, show_header=True, header_style="bold")
+        table.add_column("Client IP", style="cyan")
+
+        for conn in connections:
+            table.add_row(conn['ip'])
+
+        content = table
+
+    return Panel(
+        content,
+        title=f"[bold blue]NFS ({len(connections)})[/bold blue]",
+        box=box.ROUNDED,
+        padding=(0, 1)
+    )
+
+
+def create_connections_panel(smb_data: Dict[str, Any], nfs_data: Dict[str, Any], show_smb: bool) -> Panel:
+    """
+    Create a toggling panel that shows either SMB or NFS connections.
+
+    Args:
+        smb_data: SMB connection information
+        nfs_data: NFS connection information
+        show_smb: If True, show SMB; if False, show NFS
+
+    Returns:
+        Rich Panel with connection info
+    """
+    smb_count = len(smb_data.get('connections', []))
+    nfs_count = len(nfs_data.get('connections', []))
+
+    if show_smb:
+        connections = smb_data.get('connections', [])
+        if not connections:
+            content = Text("No active connections", style="dim")
+        else:
+            table = Table(box=None, show_header=True, header_style="bold")
+            table.add_column("User", style="cyan")
+            table.add_column("Machine")
+            for conn in connections:
+                table.add_row(conn['user'], conn['machine'])
+            content = table
+        active = "SMB"
+        inactive = "NFS"
+        active_count = smb_count
+        inactive_count = nfs_count
+    else:
+        connections = nfs_data.get('connections', [])
+        if not connections:
+            content = Text("No active connections", style="dim")
+        else:
+            table = Table(box=None, show_header=True, header_style="bold")
+            table.add_column("Client IP", style="cyan")
+            for conn in connections:
+                table.add_row(conn['ip'])
+            content = table
+        active = "NFS"
+        inactive = "SMB"
+        active_count = nfs_count
+        inactive_count = smb_count
+
+    # Title shows active view with count, and inactive count in dim
+    title = f"[bold blue]{active} ({active_count})[/bold blue] [dim]| {inactive} ({inactive_count})[/dim]"
+
+    return Panel(
+        content,
+        title=title,
+        box=box.ROUNDED,
+        padding=(0, 1)
+    )
+
+
+def create_dashboard_from_cache(cached_data: Dict[str, Any], mode: str, show_smb: bool = True) -> Layout:
+    """
+    Create the full dashboard layout from cached data.
+
+    Args:
+        cached_data: Pre-fetched data dictionary
         mode: 'local' or 'remote'
+        show_smb: If True, show SMB connections; if False, show NFS
 
     Returns:
         Rich Layout with all panels
     """
-    # Gather all data
-    pool_data = status.get_zpool_status()
-    dataset_data = status.get_dataset_usage()
-    service_data = status.get_service_status()
-    resource_data = status.get_system_resources()
-    network_data = status.get_network_stats()
-    smb_data = status.get_smb_connections()
+    pool_data = cached_data['pool']
+    dataset_data = cached_data['dataset']
+    service_data = cached_data['service']
+    resource_data = cached_data['resource']
+    network_data = cached_data['network']
+    smb_data = cached_data['smb']
+    nfs_data = cached_data['nfs']
 
     # Create layout
     layout = Layout()
@@ -670,7 +838,7 @@ def create_dashboard(status: StorageStatus, mode: str) -> Layout:
     services_panel = create_services_panel(service_data)
     resources_panel = create_resources_panel(resource_data)
     network_panel = create_network_panel(network_data)
-    smb_panel = create_smb_panel(smb_data)
+    connections_panel = create_connections_panel(smb_data, nfs_data, show_smb)
 
     # Arrange layout
     layout.split_column(
@@ -697,15 +865,41 @@ def create_dashboard(status: StorageStatus, mode: str) -> Layout:
 
     layout["right_bottom"].split_row(
         Layout(network_panel, name="network"),
-        Layout(smb_panel, name="smb"),
+        Layout(connections_panel, name="connections"),
     )
 
     layout["footer"].update(Panel(
-        Text("Press Ctrl+C to exit | Refreshing every 5 seconds", justify="center", style="dim"),
+        Text("[t] Toggle SMB/NFS | [q] Quit | Refreshing every 5s", justify="center", style="dim"),
         box=box.ROUNDED
     ))
 
     return layout
+
+
+def create_dashboard(status: StorageStatus, mode: str, show_smb: bool = True) -> Layout:
+    """
+    Create the full dashboard layout by fetching fresh data.
+
+    Args:
+        status: StorageStatus instance
+        mode: 'local' or 'remote'
+        show_smb: If True, show SMB connections; if False, show NFS
+
+    Returns:
+        Rich Layout with all panels
+    """
+    # Gather all data
+    cached_data = {
+        'pool': status.get_zpool_status(),
+        'dataset': status.get_dataset_usage(),
+        'service': status.get_service_status(),
+        'resource': status.get_system_resources(),
+        'network': status.get_network_stats(),
+        'smb': status.get_smb_connections(),
+        'nfs': status.get_nfs_connections(),
+    }
+
+    return create_dashboard_from_cache(cached_data, mode, show_smb)
 
 
 def parse_args():
@@ -817,16 +1011,81 @@ def main():
         console.print(create_dashboard(status, mode))
         return
 
+    keyboard = KeyboardListener()
+
+    # Shared state for background data fetching (with proper initial structure)
+    cached_data = {
+        'pool': {'pools': []},
+        'dataset': {'datasets': []},
+        'service': {'services': {}},
+        'resource': {},
+        'network': {'interfaces': []},
+        'smb': {'connections': []},
+        'nfs': {'connections': []},
+    }
+    data_lock = threading.Lock()
+    fetch_running = True
+
+    def fetch_data():
+        """Background thread to fetch data every 5 seconds."""
+        nonlocal cached_data
+        while fetch_running:
+            new_data = {
+                'pool': status.get_zpool_status(),
+                'dataset': status.get_dataset_usage(),
+                'service': status.get_service_status(),
+                'resource': status.get_system_resources(),
+                'network': status.get_network_stats(),
+                'smb': status.get_smb_connections(),
+                'nfs': status.get_nfs_connections(),
+            }
+            with data_lock:
+                cached_data = new_data
+            # Sleep in small increments so we can exit quickly
+            for _ in range(50):  # 5 seconds total
+                if not fetch_running:
+                    break
+                time.sleep(0.1)
+
     try:
-        with Live(console=console, refresh_per_second=0.2, screen=True) as live:
+        show_smb = True  # Toggle state for SMB/NFS panel
+        keyboard.start()
+
+        # Start background data fetcher
+        fetch_thread = threading.Thread(target=fetch_data, daemon=True)
+        fetch_thread.start()
+
+        # Wait for initial data fetch to complete
+        while not cached_data.get('pool', {}).get('pools'):
+            time.sleep(0.2)
+
+        with Live(console=console, refresh_per_second=4, screen=True) as live:
             while True:
-                dashboard = create_dashboard(status, mode)
+                # Build and display dashboard from cached data
+                with data_lock:
+                    current_data = cached_data.copy()
+                dashboard = create_dashboard_from_cache(current_data, mode, show_smb)
                 live.update(dashboard)
-                time.sleep(5)
+
+                # Check for keypress
+                key = keyboard.get_key()
+                if key:
+                    if key.lower() == 't' or key == '\t':  # 't' or Tab to toggle
+                        show_smb = not show_smb
+                        # Immediate refresh with cached data (no lock needed, just reading)
+                        dashboard = create_dashboard_from_cache(current_data, mode, show_smb)
+                        live.update(dashboard)
+                    elif key.lower() == 'q' or key == '\x03':  # 'q' or Ctrl+C to quit
+                        break
+
+                time.sleep(0.1)  # Small delay to prevent CPU spinning
 
     except KeyboardInterrupt:
+        pass
+    finally:
+        fetch_running = False
+        keyboard.stop()
         console.print("\n[dim]Dashboard stopped.[/dim]")
-        sys.exit(0)
 
 
 if __name__ == '__main__':

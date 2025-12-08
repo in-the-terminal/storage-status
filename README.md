@@ -11,7 +11,7 @@ Last Updated On: 2025-12-06
 - **System Resources** - Load average, memory usage, uptime
 - **Service Status** - SMB, NFS, SSH, ZFS services
 - **Network Interfaces** - Interface status and IP addresses
-- **SMB Connections** - Active Samba client connections
+- **SMB/NFS Connections** - Active Samba and NFS client connections (toggleable)
 
 ## Installation
 
@@ -25,6 +25,14 @@ pip3 install -r requirements.txt
 
 # Create symlink (optional)
 ln -sf "$(pwd)/storage-status.py" ~/bin/storage-status
+
+# Install man page (optional, choose one):
+# System-wide:
+sudo cp storage-status.1 /usr/local/share/man/man1/
+# Or user-local (add MANPATH to shell config):
+mkdir -p ~/share/man/man1
+cp storage-status.1 ~/share/man/man1/
+echo 'export MANPATH="$HOME/share/man:$MANPATH"' >> ~/.zshrc
 ```
 
 ## Usage
@@ -49,6 +57,15 @@ storage-status services   # Service status only
 storage-status network    # Network interfaces only
 storage-status smb        # SMB connections only
 ```
+
+## Keyboard Controls
+
+In live mode (without `--once`):
+
+| Key | Action |
+|-----|--------|
+| `t` / `Tab` | Toggle between SMB and NFS connections |
+| `q` / `Ctrl+C` | Quit |
 
 ## Auto-Detection
 
