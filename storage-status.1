@@ -32,6 +32,14 @@ Show only a specific panel. Valid values:
 .SH KEYBOARD CONTROLS
 When running in live mode (without \fB\-\-once\fR):
 .TP
+.B 1\-6
+Expand the corresponding panel to full screen.
+Panel numbers are shown in the panel titles.
+Currently implemented: \fB6\fR for NFS details (active connections and mounted exports).
+.TP
+.B Esc / Backspace
+Return to the main dashboard from an expanded view.
+.TP
 .B t
 Toggle between SMB and NFS connections panel.
 .TP
@@ -78,6 +86,17 @@ Lists network interfaces with their state (UP/DOWN) and IP addresses.
 .SS SMB/NFS Connections
 Toggleable panel showing either SMB connections (user and machine) or NFS connections
 (client IP addresses). Press \fBt\fR to toggle. The panel title shows counts for both.
+Multiple connections from the same client are deduplicated with a count suffix (e.g., "x2").
+.SS NFS Expanded View
+Press \fB6\fR to view detailed NFS information in two sections:
+.RS
+.IP \(bu 2
+\fBActive Connections\fR \- TCP connections on port 2049 with client hostname (reverse DNS),
+bytes sent/received, RTT latency, and last activity time.
+.IP \(bu 2
+\fBConfigured Exports\fR \- NFS exports from \fI/etc/exports\fR showing paths, allowed clients,
+and export options.
+.RE
 .SH ENVIRONMENT
 .TP
 .B STORAGE_SSH_HOST
@@ -149,7 +168,9 @@ The SSH user on the storage server needs access to:
 .IP \(bu 2
 \fB/proc/loadavg\fR, \fB/proc/meminfo\fR \- System stats (world-readable)
 .IP \(bu 2
-\fBss\fR \- Socket statistics for NFS connections
+\fBss\fR \- Socket statistics for NFS connections (with \fB-i\fR for extended metrics)
+.IP \(bu 2
+\fB/etc/exports\fR \- NFS export configuration (world-readable)
 .RE
 .SH EXAMPLES
 .TP

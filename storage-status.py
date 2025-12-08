@@ -511,27 +511,180 @@ class StorageStatus:
     def get_nfs_connections(self) -> Dict[str, Any]:
         """
         Get active NFS connections by checking established connections on port 2049.
+        Uses ss -i for extended TCP metrics (bytes, RTT, timing).
 
         Returns:
-            Dictionary with NFS connection information
+            Dictionary with NFS connection information including:
+            - ip: Client IP address
+            - hostname: Reverse DNS hostname (if resolvable)
+            - port: Client source port
+            - bytes_acked: Bytes acknowledged by client
+            - bytes_received: Bytes received from client
+            - rtt: Round-trip time in ms
+            - lastsnd: Time since last send (ms)
+            - lastrcv: Time since last receive (ms)
         """
         connections = []
 
-        # Get established TCP connections on NFS port (2049)
+        # Get established TCP connections on NFS port (2049) with extended info
+        # ss -i outputs connection info followed by extended stats on next line
         success, output = self.runner.run(
-            "ss -tn state established '( sport = :2049 )' 2>/dev/null | tail -n +2"
+            "ss -tin state established '( sport = :2049 )' 2>/dev/null"
         )
         if success and output.strip():
-            for line in output.strip().split('\n'):
-                if line.strip():
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        # Peer address is in format ip:port
-                        peer = parts[3]
-                        ip = peer.rsplit(':', 1)[0] if ':' in peer else peer
-                        connections.append({'ip': ip})
+            lines = output.strip().split('\n')
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                # Skip header line
+                if line.startswith('State') or line.startswith('Recv-Q'):
+                    i += 1
+                    continue
+
+                # Parse connection line (format: Recv-Q Send-Q Local:Port Peer:Port Process)
+                parts = line.split()
+                if len(parts) >= 4:
+                    # Peer address is typically in position 4 (0-indexed: 3)
+                    # Format varies: could be "ip:port" or "[ipv6]:port"
+                    peer = parts[3]
+                    if peer.startswith('['):
+                        # IPv6: [::1]:port
+                        bracket_end = peer.rfind(']')
+                        ip = peer[1:bracket_end]
+                        port = peer[bracket_end+2:] if bracket_end+2 < len(peer) else '-'
+                    elif ':' in peer:
+                        ip, port = peer.rsplit(':', 1)
+                    else:
+                        ip = peer
+                        port = '-'
+
+                    conn = {
+                        'ip': ip,
+                        'port': port,
+                        'hostname': None,
+                        'bytes_acked': None,
+                        'bytes_received': None,
+                        'rtt': None,
+                        'lastsnd': None,
+                        'lastrcv': None,
+                    }
+
+                    # Check if next line contains extended info (starts with whitespace)
+                    if i + 1 < len(lines) and lines[i + 1].startswith('\t'):
+                        ext_line = lines[i + 1].strip()
+                        # Parse extended stats: bytes_acked:123 bytes_received:456 ...
+                        conn['bytes_acked'] = self._parse_ss_metric(ext_line, 'bytes_acked')
+                        conn['bytes_received'] = self._parse_ss_metric(ext_line, 'bytes_received')
+                        conn['rtt'] = self._parse_ss_metric(ext_line, 'rtt')
+                        conn['lastsnd'] = self._parse_ss_metric(ext_line, 'lastsnd')
+                        conn['lastrcv'] = self._parse_ss_metric(ext_line, 'lastrcv')
+                        i += 1
+
+                    connections.append(conn)
+                i += 1
+
+        # Resolve hostnames for unique IPs (with caching)
+        self._resolve_hostnames(connections)
 
         return {'connections': connections}
+
+    def _parse_ss_metric(self, line: str, metric: str) -> Optional[str]:
+        """
+        Parse a specific metric value from ss -i extended output.
+
+        Args:
+            line: The extended stats line from ss -i
+            metric: The metric name to extract (e.g., 'bytes_acked', 'rtt')
+
+        Returns:
+            The metric value as string, or None if not found
+        """
+        # Metrics appear as "metric:value" or "metric:value/unit"
+        pattern = rf'\b{metric}:(\S+)'
+        match = re.search(pattern, line)
+        if match:
+            return match.group(1)
+        return None
+
+    def _resolve_hostnames(self, connections: List[Dict[str, Any]]) -> None:
+        """
+        Resolve hostnames for connection IPs via reverse DNS.
+        Modifies connections in place, adding 'hostname' field.
+
+        Args:
+            connections: List of connection dictionaries to update
+        """
+        # Get unique IPs to avoid redundant lookups
+        unique_ips = set(conn['ip'] for conn in connections if conn.get('ip'))
+        hostname_cache: Dict[str, Optional[str]] = {}
+
+        for ip in unique_ips:
+            try:
+                # Reverse DNS lookup with timeout (socket default)
+                hostname, _, _ = socket.gethostbyaddr(ip)
+                hostname_cache[ip] = hostname
+            except (socket.herror, socket.gaierror, socket.timeout):
+                # No reverse DNS entry or lookup failed
+                hostname_cache[ip] = None
+
+        # Apply resolved hostnames to connections
+        for conn in connections:
+            ip = conn.get('ip')
+            if ip in hostname_cache:
+                conn['hostname'] = hostname_cache[ip]
+
+    def get_nfs_exports(self) -> Dict[str, Any]:
+        """
+        Get configured NFS exports from /etc/exports.
+
+        Returns:
+            Dictionary with export information:
+            - exports: List of {path, clients, options}
+        """
+        exports = []
+
+        success, output = self.runner.run("cat /etc/exports 2>/dev/null")
+        if success and output.strip():
+            for line in output.strip().split('\n'):
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                # Format: "/path" client(options) or "/path" *(options)
+                # Path may be quoted
+                if line.startswith('"'):
+                    # Quoted path
+                    end_quote = line.find('"', 1)
+                    if end_quote == -1:
+                        continue
+                    path = line[1:end_quote]
+                    rest = line[end_quote + 1:].strip()
+                else:
+                    # Unquoted path
+                    parts = line.split(None, 1)
+                    if not parts:
+                        continue
+                    path = parts[0]
+                    rest = parts[1] if len(parts) > 1 else ''
+
+                # Parse client(options) - may have multiple
+                # Format: client(opts) or *(opts) or client1(opts) client2(opts)
+                clients_opts = []
+                for entry in rest.split():
+                    if '(' in entry:
+                        client_part = entry.split('(')[0]
+                        opts_part = entry.split('(')[1].rstrip(')')
+                        clients_opts.append({
+                            'client': client_part if client_part else '*',
+                            'options': opts_part,
+                        })
+
+                exports.append({
+                    'path': path,
+                    'clients': clients_opts,
+                })
+
+        return {'exports': exports}
 
 
 def create_pool_panel(pool_data: Dict[str, Any]) -> Panel:
@@ -547,7 +700,7 @@ def create_pool_panel(pool_data: Dict[str, Any]) -> Panel:
     if 'error' in pool_data:
         return Panel(
             Text(f"Error: {pool_data['error']}", style="red"),
-            title="[bold blue]ZFS Pools[/bold blue]",
+            title="[bold blue][1] ZFS Pools[/bold blue]",
             box=box.ROUNDED
         )
 
@@ -574,7 +727,7 @@ def create_pool_panel(pool_data: Dict[str, Any]) -> Panel:
 
     return Panel(
         table,
-        title="[bold blue]ZFS Pools[/bold blue]",
+        title="[bold blue][1] ZFS Pools[/bold blue]",
         box=box.ROUNDED,
         padding=(0, 1)
     )
@@ -593,7 +746,7 @@ def create_dataset_panel(dataset_data: Dict[str, Any]) -> Panel:
     if 'error' in dataset_data:
         return Panel(
             Text(f"Error: {dataset_data['error']}", style="red"),
-            title="[bold blue]ZFS Datasets[/bold blue]",
+            title="[bold blue][2] ZFS Datasets[/bold blue]",
             box=box.ROUNDED
         )
 
@@ -618,7 +771,7 @@ def create_dataset_panel(dataset_data: Dict[str, Any]) -> Panel:
 
     return Panel(
         table,
-        title="[bold blue]ZFS Datasets[/bold blue]",
+        title="[bold blue][2] ZFS Datasets[/bold blue]",
         box=box.ROUNDED,
         padding=(0, 1)
     )
@@ -656,7 +809,7 @@ def create_services_panel(service_data: Dict[str, Any]) -> Panel:
 
     return Panel(
         table,
-        title="[bold blue]Services[/bold blue]",
+        title="[bold blue][3] Services[/bold blue]",
         box=box.ROUNDED,
         padding=(0, 1)
     )
@@ -727,7 +880,7 @@ def create_network_panel(network_data: Dict[str, Any]) -> Panel:
 
     return Panel(
         table,
-        title="[bold blue]Network Interfaces[/bold blue]",
+        title="[bold blue][4] Network Interfaces[/bold blue]",
         box=box.ROUNDED,
         padding=(0, 1)
     )
@@ -816,11 +969,19 @@ def create_connections_panel(smb_data: Dict[str, Any], nfs_data: Dict[str, Any],
         if not connections:
             content = Text("No active connections", style="dim")
         else:
+            # Group by user@machine and count
+            user_machine_counts: Dict[str, int] = {}
+            for conn in connections:
+                key = f"{conn['user']}@{conn['machine']}"
+                user_machine_counts[key] = user_machine_counts.get(key, 0) + 1
+
             table = Table(box=None, show_header=True, header_style="bold")
             table.add_column("User", style="cyan")
             table.add_column("Machine")
-            for conn in connections:
-                table.add_row(conn['user'], conn['machine'])
+            for key, count in user_machine_counts.items():
+                user, machine = key.split('@', 1)
+                machine_display = f"{machine} (x{count})" if count > 1 else machine
+                table.add_row(user, machine_display)
             content = table
         active = "SMB"
         inactive = "NFS"
@@ -831,18 +992,28 @@ def create_connections_panel(smb_data: Dict[str, Any], nfs_data: Dict[str, Any],
         if not connections:
             content = Text("No active connections", style="dim")
         else:
+            # Count connections per IP
+            ip_counts: Dict[str, int] = {}
+            for conn in connections:
+                ip = conn.get('ip', 'unknown')
+                ip_counts[ip] = ip_counts.get(ip, 0) + 1
+
             table = Table(box=None, show_header=True, header_style="bold")
             table.add_column("Client IP", style="cyan")
-            for conn in connections:
-                table.add_row(conn['ip'])
+            for ip, count in ip_counts.items():
+                display = f"{ip} (x{count})" if count > 1 else ip
+                table.add_row(display)
             content = table
         active = "NFS"
         inactive = "SMB"
         active_count = nfs_count
         inactive_count = smb_count
 
-    # Title shows active view with count, and inactive count in dim
-    title = f"[bold blue]{active} ({active_count})[/bold blue] [dim]| {inactive} ({inactive_count})[/dim]"
+    # Title shows active view with count, number hints, and inactive count in dim
+    if show_smb:
+        title = f"[bold blue][5] SMB ({smb_count})[/bold blue] [dim]| [6] NFS ({nfs_count})[/dim]"
+    else:
+        title = f"[dim][5] SMB ({smb_count}) |[/dim] [bold blue][6] NFS ({nfs_count})[/bold blue]"
 
     return Panel(
         content,
@@ -920,11 +1091,268 @@ def create_dashboard_from_cache(cached_data: Dict[str, Any], mode: str, show_smb
     )
 
     layout["footer"].update(Panel(
-        Text("[t] Toggle SMB/NFS | [q] Quit | Refreshing every 5s", justify="center", style="dim"),
+        Text("[1-6] Expand | [t] Toggle SMB/NFS | [q] Quit", justify="center", style="dim"),
         box=box.ROUNDED
     ))
 
     return layout
+
+
+def _format_bytes(bytes_str: Optional[str]) -> str:
+    """
+    Format bytes value from ss output to human-readable format.
+
+    Args:
+        bytes_str: Bytes value as string (e.g., '123456')
+
+    Returns:
+        Human-readable size string (e.g., '120.5 KB')
+    """
+    if not bytes_str:
+        return '-'
+    try:
+        bytes_val = int(bytes_str)
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if abs(bytes_val) < 1024.0:
+                return f"{bytes_val:.1f} {unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.1f} PB"
+    except (ValueError, TypeError):
+        return bytes_str
+
+
+def _format_rtt(rtt_str: Optional[str]) -> str:
+    """
+    Format RTT value from ss output (format: rtt/rttvar).
+
+    Args:
+        rtt_str: RTT string (e.g., '0.123/0.045')
+
+    Returns:
+        Formatted RTT (e.g., '0.12 ms')
+    """
+    if not rtt_str:
+        return '-'
+    # RTT is in format "rtt/rttvar" - extract just the rtt part
+    rtt_val = rtt_str.split('/')[0]
+    try:
+        ms = float(rtt_val)
+        return f"{ms:.2f} ms"
+    except (ValueError, TypeError):
+        return rtt_str
+
+
+def _format_last_activity(ms_str: Optional[str]) -> str:
+    """
+    Format last activity time from ss output.
+
+    Args:
+        ms_str: Milliseconds as string
+
+    Returns:
+        Human-readable time (e.g., '5.2s ago')
+    """
+    if not ms_str:
+        return '-'
+    try:
+        ms = int(ms_str)
+        if ms < 1000:
+            return f"{ms}ms ago"
+        elif ms < 60000:
+            return f"{ms/1000:.1f}s ago"
+        else:
+            return f"{ms/60000:.1f}m ago"
+    except (ValueError, TypeError):
+        return ms_str
+
+
+def _format_client_display(ip: str, hostname: Optional[str], ip_width: int = 15) -> str:
+    """
+    Format client display string with IP first and consistent spacing.
+
+    Args:
+        ip: Client IP address
+        hostname: Resolved hostname (or None)
+        ip_width: Width to pad IP addresses for alignment (default 15 for xxx.xxx.xxx.xxx)
+
+    Returns:
+        Formatted string like "10.27.27.11   hostname" or just "10.27.27.11"
+    """
+    # Pad IP to consistent width for alignment
+    padded_ip = ip.ljust(ip_width)
+    if hostname:
+        return f"{padded_ip} {hostname}"
+    return ip
+
+
+def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, Any], mode: str) -> Layout:
+    """
+    Create a full-screen expanded view of NFS connections with two sections:
+    active TCP connections and configured exports.
+
+    Args:
+        nfs_data: NFS connection information from get_nfs_connections()
+        nfs_exports: NFS export configuration from get_nfs_exports()
+        mode: 'local' or 'remote'
+
+    Returns:
+        Rich Layout with expanded NFS view
+    """
+    layout = Layout()
+
+    # Header
+    mode_text = "Local" if mode == 'local' else f"Remote ({SSH_HOST})"
+    header = Panel(
+        Text(f"NFS Details - {mode_text} - {datetime.now().strftime('%H:%M:%S')}",
+             justify="center", style="bold"),
+        box=box.ROUNDED
+    )
+
+    # Section 1: Active TCP Connections
+    connections = nfs_data.get('connections', [])
+
+    if not connections:
+        conn_panel = Panel(
+            Text("No active NFS connections", style="dim", justify="center"),
+            title=f"[bold blue]Active Connections (0)[/bold blue]",
+            box=box.ROUNDED
+        )
+    else:
+        conn_table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        conn_table.add_column("#", style="dim", width=4)
+        conn_table.add_column("Client", style="cyan", no_wrap=True)
+        conn_table.add_column("Port", style="dim", width=7)
+        conn_table.add_column("Sent", justify="right", width=12)
+        conn_table.add_column("Recv", justify="right", width=12)
+        conn_table.add_column("RTT", justify="right", width=10)
+        conn_table.add_column("Last Activity", justify="right", width=12)
+
+        for idx, conn in enumerate(connections, 1):
+            # Display IP first with consistent spacing, then hostname
+            hostname = conn.get('hostname')
+            ip = conn.get('ip', 'unknown')
+            client_display = _format_client_display(ip, hostname)
+
+            # Format last activity from lastsnd or lastrcv (whichever is more recent)
+            lastsnd = conn.get('lastsnd')
+            lastrcv = conn.get('lastrcv')
+            last_activity = '-'
+            if lastsnd or lastrcv:
+                # Use the smaller value (more recent activity)
+                try:
+                    snd = int(lastsnd) if lastsnd else float('inf')
+                    rcv = int(lastrcv) if lastrcv else float('inf')
+                    last_ms = str(min(snd, rcv)) if min(snd, rcv) != float('inf') else None
+                    last_activity = _format_last_activity(last_ms)
+                except (ValueError, TypeError):
+                    last_activity = '-'
+
+            conn_table.add_row(
+                str(idx),
+                client_display,
+                conn.get('port', '-'),
+                _format_bytes(conn.get('bytes_acked')),
+                _format_bytes(conn.get('bytes_received')),
+                _format_rtt(conn.get('rtt')),
+                last_activity,
+            )
+
+        conn_panel = Panel(
+            conn_table,
+            title=f"[bold blue]Active Connections ({len(connections)})[/bold blue]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Section 2: Configured Exports
+    exports = nfs_exports.get('exports', [])
+
+    if not exports:
+        export_panel = Panel(
+            Text("No NFS exports configured", style="dim", justify="center"),
+            title=f"[bold blue]Configured Exports (0)[/bold blue]",
+            box=box.ROUNDED
+        )
+    else:
+        export_table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        export_table.add_column("#", style="dim", width=4)
+        export_table.add_column("Export Path", style="green", no_wrap=True)
+        export_table.add_column("Allowed Clients", style="cyan")
+        export_table.add_column("Options", style="dim")
+
+        for idx, export in enumerate(exports, 1):
+            # Format clients and options
+            clients_list = export.get('clients', [])
+            if clients_list:
+                clients_str = ', '.join(c.get('client', '*') for c in clients_list)
+                # Show first client's options (typically same for all)
+                options_str = clients_list[0].get('options', '') if clients_list else ''
+            else:
+                clients_str = '*'
+                options_str = ''
+
+            export_table.add_row(
+                str(idx),
+                export.get('path', '-'),
+                clients_str,
+                options_str,
+            )
+
+        export_panel = Panel(
+            export_table,
+            title=f"[bold blue]Configured Exports ({len(exports)})[/bold blue]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Footer
+    footer = Panel(
+        Text("[Esc] Back | [q] Quit", justify="center", style="dim"),
+        box=box.ROUNDED
+    )
+
+    # Arrange layout with two sections
+    layout.split_column(
+        Layout(header, name="header", size=3),
+        Layout(name="body"),
+        Layout(footer, name="footer", size=3)
+    )
+
+    # Split body into two sections (connections on top, exports below)
+    layout["body"].split_column(
+        Layout(conn_panel, name="connections"),
+        Layout(export_panel, name="exports"),
+    )
+
+    return layout
+
+
+def create_view(current_view: str, cached_data: Dict[str, Any], mode: str, show_smb: bool) -> Layout:
+    """
+    Route to appropriate view based on current_view state.
+
+    Args:
+        current_view: Current view name ('dashboard', 'nfs', etc.)
+        cached_data: Pre-fetched data dictionary
+        mode: 'local' or 'remote'
+        show_smb: If True, show SMB in connections panel; if False, show NFS
+
+    Returns:
+        Rich Layout for the requested view
+    """
+    if current_view == 'nfs':
+        return create_expanded_nfs_view(
+            cached_data['nfs'],
+            cached_data.get('nfs_exports', {'exports': []}),
+            mode
+        )
+    # Future expanded views will be added here
+    # elif current_view == 'smb':
+    #     return create_expanded_smb_view(cached_data['smb'], mode)
+    # etc.
+
+    # Default: main dashboard
+    return create_dashboard_from_cache(cached_data, mode, show_smb)
 
 
 def create_dashboard(status: StorageStatus, mode: str, show_smb: bool = True) -> Layout:
@@ -1079,6 +1507,7 @@ def main():
         'network': {'interfaces': []},
         'smb': {'connections': []},
         'nfs': {'connections': []},
+        'nfs_exports': {'exports': []},
     }
     data_lock = threading.Lock()
     fetch_running = True
@@ -1095,6 +1524,7 @@ def main():
                 'network': status.get_network_stats(),
                 'smb': status.get_smb_connections(),
                 'nfs': status.get_nfs_connections(),
+                'nfs_exports': status.get_nfs_exports(),
             }
             with data_lock:
                 cached_data = new_data
@@ -1106,6 +1536,7 @@ def main():
 
     try:
         show_smb = True  # Toggle state for SMB/NFS panel
+        current_view = 'dashboard'  # View state: 'dashboard', 'nfs', etc.
         keyboard.start()
 
         # Start background data fetcher
@@ -1118,21 +1549,33 @@ def main():
 
         with Live(console=console, refresh_per_second=4, screen=True) as live:
             while True:
-                # Build and display dashboard from cached data
+                # Build and display view from cached data
                 with data_lock:
                     current_data = cached_data.copy()
-                dashboard = create_dashboard_from_cache(current_data, mode, show_smb)
-                live.update(dashboard)
+                view = create_view(current_view, current_data, mode, show_smb)
+                live.update(view)
 
                 # Check for keypress
                 key = keyboard.get_key()
                 if key:
-                    if key.lower() == 't' or key == '\t':  # 't' or Tab to toggle
+                    # Number keys for expanded views (only on dashboard)
+                    if current_view == 'dashboard' and key == '6':
+                        current_view = 'nfs'
+                    # Future: add keys 1-5 for other expanded views
+                    # elif current_view == 'dashboard' and key == '5':
+                    #     current_view = 'smb'
+                    # etc.
+
+                    # Escape or Backspace to return to dashboard
+                    elif key == '\x1b' or key == '\x7f':  # Esc or Backspace
+                        current_view = 'dashboard'
+
+                    # Toggle SMB/NFS (only on dashboard)
+                    elif current_view == 'dashboard' and (key.lower() == 't' or key == '\t'):
                         show_smb = not show_smb
-                        # Immediate refresh with cached data (no lock needed, just reading)
-                        dashboard = create_dashboard_from_cache(current_data, mode, show_smb)
-                        live.update(dashboard)
-                    elif key.lower() == 'q' or key == '\x03':  # 'q' or Ctrl+C to quit
+
+                    # Quit
+                    elif key.lower() == 'q' or key == '\x03':  # 'q' or Ctrl+C
                         break
 
                 time.sleep(0.1)  # Small delay to prevent CPU spinning
