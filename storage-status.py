@@ -15,6 +15,7 @@ Last Updated On: 2025-12-08
 """
 
 import argparse
+import json
 import subprocess
 import socket
 import os
@@ -486,27 +487,162 @@ class StorageStatus:
 
     def get_smb_connections(self) -> Dict[str, Any]:
         """
-        Get active SMB connections.
+        Get active SMB connections using smbstatus --json for detailed info.
 
         Returns:
-            Dictionary with SMB connection information
+            Dictionary with SMB connection information including:
+            - pid: Process ID
+            - user: Username
+            - machine: Client machine name/IP
+            - hostname: Reverse DNS hostname (if resolvable)
+            - protocol: SMB protocol version (e.g., SMB3_11)
+            - connected: Connection timestamp
         """
         connections = []
 
-        success, output = self.runner.run("smbstatus -b 2>/dev/null | tail -n +5")
+        # Try JSON output first for richer data
+        success, output = self.runner.run("smbstatus --json 2>/dev/null")
         if success and output.strip():
-            for line in output.strip().split('\n'):
-                if line.strip():
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        connections.append({
-                            'pid': parts[0],
-                            'user': parts[1],
-                            'group': parts[2],
-                            'machine': parts[3] if len(parts) > 3 else 'unknown',
-                        })
+            try:
+                data = json.loads(output)
+                sessions = data.get('sessions', {})
+
+                for session_id, session in sessions.items():
+                    # Extract machine/IP - could be hostname or IP
+                    machine = session.get('remote_machine', 'unknown')
+                    hostname = session.get('hostname', '')
+
+                    # Parse connection time from session
+                    connected = session.get('session_started', '')
+                    if connected:
+                        # Format: "2025-12-08T12:34:56+0000" -> "12:34:56"
+                        try:
+                            if 'T' in connected:
+                                time_part = connected.split('T')[1].split('+')[0].split('-')[0]
+                                connected = time_part[:8]  # HH:MM:SS
+                        except (IndexError, ValueError):
+                            pass
+
+                    connections.append({
+                        'pid': session.get('server_id', {}).get('pid', '-'),
+                        'user': session.get('username', 'unknown'),
+                        'machine': machine,
+                        'hostname': hostname if hostname and hostname != machine else None,
+                        'protocol': session.get('signing', {}).get('dialect', '-'),
+                        'connected': connected,
+                    })
+
+            except (json.JSONDecodeError, KeyError):
+                # Fall back to basic smbstatus -b
+                pass
+
+        # Fallback to basic output if JSON failed or no connections found
+        if not connections:
+            success, output = self.runner.run("smbstatus -b 2>/dev/null | tail -n +5")
+            if success and output.strip():
+                for line in output.strip().split('\n'):
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            connections.append({
+                                'pid': parts[0],
+                                'user': parts[1],
+                                'machine': parts[3] if len(parts) > 3 else 'unknown',
+                                'hostname': None,
+                                'protocol': '-',
+                                'connected': '-',
+                            })
+
+        # Resolve hostnames for machine IPs that look like IPs
+        self._resolve_smb_hostnames(connections)
 
         return {'connections': connections}
+
+    def _resolve_smb_hostnames(self, connections: List[Dict[str, Any]]) -> None:
+        """
+        Resolve hostnames for SMB connection machine IPs via reverse DNS.
+
+        Args:
+            connections: List of connection dictionaries to update
+        """
+        # Get unique machines that look like IPs (no hostname yet)
+        ip_pattern = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+        machines_to_resolve = set()
+        for conn in connections:
+            machine = conn.get('machine', '')
+            if ip_pattern.match(machine) and not conn.get('hostname'):
+                machines_to_resolve.add(machine)
+
+        hostname_cache: Dict[str, Optional[str]] = {}
+        for machine in machines_to_resolve:
+            try:
+                hostname, _, _ = socket.gethostbyaddr(machine)
+                hostname_cache[machine] = hostname
+            except (socket.herror, socket.gaierror, socket.timeout):
+                hostname_cache[machine] = None
+
+        # Apply resolved hostnames
+        for conn in connections:
+            machine = conn.get('machine', '')
+            if machine in hostname_cache and not conn.get('hostname'):
+                conn['hostname'] = hostname_cache[machine]
+
+    def get_smb_shares(self) -> Dict[str, Any]:
+        """
+        Get configured SMB shares from smb.conf via testparm.
+
+        Returns:
+            Dictionary with share information:
+            - shares: List of {name, path, comment, valid_users, read_only}
+        """
+        shares = []
+
+        success, output = self.runner.run("testparm -s 2>/dev/null")
+        if success and output.strip():
+            current_share = None
+
+            for line in output.split('\n'):
+                line = line.rstrip()
+
+                # New share section: [share_name]
+                if line.startswith('[') and line.endswith(']'):
+                    # Save previous share if exists (skip [global])
+                    if current_share and current_share['name'] != 'global':
+                        shares.append(current_share)
+
+                    share_name = line[1:-1]
+                    current_share = {
+                        'name': share_name,
+                        'path': '',
+                        'comment': '',
+                        'valid_users': '',
+                        'read_only': True,  # Default in Samba
+                    }
+
+                # Parse share properties
+                elif current_share and '=' in line:
+                    # Format: "\tkey = value" or "key = value"
+                    line = line.strip()
+                    if '=' in line:
+                        key, _, value = line.partition('=')
+                        key = key.strip().lower()
+                        value = value.strip()
+
+                        if key == 'path':
+                            current_share['path'] = value
+                        elif key == 'comment':
+                            current_share['comment'] = value
+                        elif key == 'valid users':
+                            current_share['valid_users'] = value
+                        elif key == 'read only':
+                            current_share['read_only'] = value.lower() != 'no'
+
+            # Don't forget the last share
+            if current_share and current_share['name'] != 'global':
+                shares.append(current_share)
+
+        return {'shares': shares}
 
     def get_nfs_connections(self) -> Dict[str, Any]:
         """
@@ -1327,6 +1463,126 @@ def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, An
     return layout
 
 
+def create_expanded_smb_view(smb_data: Dict[str, Any], smb_shares: Dict[str, Any], mode: str) -> Layout:
+    """
+    Create a full-screen expanded view of SMB connections with two sections:
+    active sessions and configured shares.
+
+    Args:
+        smb_data: SMB connection information from get_smb_connections()
+        smb_shares: SMB share configuration from get_smb_shares()
+        mode: 'local' or 'remote'
+
+    Returns:
+        Rich Layout with expanded SMB view
+    """
+    layout = Layout()
+
+    # Header
+    mode_text = "Local" if mode == 'local' else f"Remote ({SSH_HOST})"
+    header = Panel(
+        Text(f"SMB Details - {mode_text} - {datetime.now().strftime('%H:%M:%S')}",
+             justify="center", style="bold"),
+        box=box.ROUNDED
+    )
+
+    # Section 1: Active Connections
+    connections = smb_data.get('connections', [])
+
+    if not connections:
+        conn_panel = Panel(
+            Text("No active SMB connections", style="dim", justify="center"),
+            title=f"[bold blue]Active Connections (0)[/bold blue]",
+            box=box.ROUNDED
+        )
+    else:
+        conn_table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        conn_table.add_column("#", style="dim", width=4)
+        conn_table.add_column("Client", style="cyan", no_wrap=True)
+        conn_table.add_column("User", style="green")
+        conn_table.add_column("Protocol", style="dim", width=10)
+        conn_table.add_column("Connected", justify="right", width=10)
+
+        for idx, conn in enumerate(connections, 1):
+            # Display machine/IP with hostname using consistent format
+            machine = conn.get('machine', 'unknown')
+            hostname = conn.get('hostname')
+            client_display = _format_client_display(machine, hostname)
+
+            conn_table.add_row(
+                str(idx),
+                client_display,
+                conn.get('user', '-'),
+                conn.get('protocol', '-'),
+                conn.get('connected', '-'),
+            )
+
+        conn_panel = Panel(
+            conn_table,
+            title=f"[bold blue]Active Connections ({len(connections)})[/bold blue]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Section 2: Configured Shares
+    shares = smb_shares.get('shares', [])
+
+    if not shares:
+        share_panel = Panel(
+            Text("No SMB shares configured", style="dim", justify="center"),
+            title=f"[bold blue]Configured Shares (0)[/bold blue]",
+            box=box.ROUNDED
+        )
+    else:
+        share_table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        share_table.add_column("#", style="dim", width=4)
+        share_table.add_column("Share", style="cyan", no_wrap=True)
+        share_table.add_column("Path", style="green")
+        share_table.add_column("Valid Users", style="dim")
+        share_table.add_column("Access", width=12)
+
+        for idx, share in enumerate(shares, 1):
+            # Format access as Read/Write or Read Only
+            access = "Read Only" if share.get('read_only', True) else "Read/Write"
+            access_style = "yellow" if share.get('read_only', True) else "green"
+
+            share_table.add_row(
+                str(idx),
+                share.get('name', '-'),
+                share.get('path', '-'),
+                share.get('valid_users', '*') or '*',
+                Text(access, style=access_style),
+            )
+
+        share_panel = Panel(
+            share_table,
+            title=f"[bold blue]Configured Shares ({len(shares)})[/bold blue]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Footer
+    footer = Panel(
+        Text("[Esc] Back | [q] Quit", justify="center", style="dim"),
+        box=box.ROUNDED
+    )
+
+    # Arrange layout with two sections
+    layout.split_column(
+        Layout(header, name="header", size=3),
+        Layout(name="body"),
+        Layout(footer, name="footer", size=3)
+    )
+
+    # Split body into two sections (connections on top, shares below)
+    layout["body"].split_column(
+        Layout(conn_panel, name="connections"),
+        Layout(share_panel, name="shares"),
+    )
+
+    return layout
+
+
 def create_view(current_view: str, cached_data: Dict[str, Any], mode: str, show_smb: bool) -> Layout:
     """
     Route to appropriate view based on current_view state.
@@ -1346,10 +1602,13 @@ def create_view(current_view: str, cached_data: Dict[str, Any], mode: str, show_
             cached_data.get('nfs_exports', {'exports': []}),
             mode
         )
-    # Future expanded views will be added here
-    # elif current_view == 'smb':
-    #     return create_expanded_smb_view(cached_data['smb'], mode)
-    # etc.
+    elif current_view == 'smb':
+        return create_expanded_smb_view(
+            cached_data['smb'],
+            cached_data.get('smb_shares', {'shares': []}),
+            mode
+        )
+    # Future expanded views: pools, datasets, services, network
 
     # Default: main dashboard
     return create_dashboard_from_cache(cached_data, mode, show_smb)
@@ -1506,6 +1765,7 @@ def main():
         'resource': {},
         'network': {'interfaces': []},
         'smb': {'connections': []},
+        'smb_shares': {'shares': []},
         'nfs': {'connections': []},
         'nfs_exports': {'exports': []},
     }
@@ -1523,6 +1783,7 @@ def main():
                 'resource': status.get_system_resources(),
                 'network': status.get_network_stats(),
                 'smb': status.get_smb_connections(),
+                'smb_shares': status.get_smb_shares(),
                 'nfs': status.get_nfs_connections(),
                 'nfs_exports': status.get_nfs_exports(),
             }
@@ -1559,12 +1820,11 @@ def main():
                 key = keyboard.get_key()
                 if key:
                     # Number keys for expanded views (only on dashboard)
-                    if current_view == 'dashboard' and key == '6':
+                    if current_view == 'dashboard' and key == '5':
+                        current_view = 'smb'
+                    elif current_view == 'dashboard' and key == '6':
                         current_view = 'nfs'
-                    # Future: add keys 1-5 for other expanded views
-                    # elif current_view == 'dashboard' and key == '5':
-                    #     current_view = 'smb'
-                    # etc.
+                    # Future: add keys 1-4 for other expanded views
 
                     # Escape or Backspace to return to dashboard
                     elif key == '\x1b' or key == '\x7f':  # Esc or Backspace

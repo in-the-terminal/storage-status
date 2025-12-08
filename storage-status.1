@@ -35,7 +35,7 @@ When running in live mode (without \fB\-\-once\fR):
 .B 1\-6
 Expand the corresponding panel to full screen.
 Panel numbers are shown in the panel titles.
-Currently implemented: \fB6\fR for NFS details (active connections and mounted exports).
+Currently implemented: \fB5\fR for SMB details, \fB6\fR for NFS details.
 .TP
 .B Esc / Backspace
 Return to the main dashboard from an expanded view.
@@ -87,6 +87,16 @@ Lists network interfaces with their state (UP/DOWN) and IP addresses.
 Toggleable panel showing either SMB connections (user and machine) or NFS connections
 (client IP addresses). Press \fBt\fR to toggle. The panel title shows counts for both.
 Multiple connections from the same client are deduplicated with a count suffix (e.g., "x2").
+.SS SMB Expanded View
+Press \fB5\fR to view detailed SMB information in two sections:
+.RS
+.IP \(bu 2
+\fBActive Connections\fR \- SMB sessions showing client hostname/IP, username,
+protocol version (e.g., SMB3_11), and connection time.
+.IP \(bu 2
+\fBConfigured Shares\fR \- SMB shares from \fIsmb.conf\fR showing share name, path,
+valid users, and access mode (Read/Write or Read Only).
+.RE
 .SS NFS Expanded View
 Press \fB6\fR to view detailed NFS information in two sections:
 .RS
@@ -164,7 +174,9 @@ The SSH user on the storage server needs access to:
 .IP \(bu 2
 \fBsystemctl\fR \- Service status (read-only)
 .IP \(bu 2
-\fBsmbstatus\fR \- May require membership in \fBsambashare\fR group
+\fBsmbstatus\fR \- SMB connection details (may require \fBsambashare\fR group)
+.IP \(bu 2
+\fBtestparm\fR \- SMB share configuration
 .IP \(bu 2
 \fB/proc/loadavg\fR, \fB/proc/meminfo\fR \- System stats (world-readable)
 .IP \(bu 2

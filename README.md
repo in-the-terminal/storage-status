@@ -68,8 +68,8 @@ In live mode (without `--once`):
 | `2` | Expand ZFS Datasets (coming soon) |
 | `3` | Expand Services (coming soon) |
 | `4` | Expand Network Interfaces (coming soon) |
-| `5` | Expand SMB Connections (coming soon) |
-| `6` | Expand NFS Details (connections + mounts) |
+| `5` | Expand SMB Details (connections + shares) |
+| `6` | Expand NFS Details (connections + exports) |
 | `Esc` / `Backspace` | Return to main dashboard |
 | `t` / `Tab` | Toggle between SMB and NFS connections |
 | `q` / `Ctrl+C` | Quit |
@@ -137,7 +137,8 @@ The SSH user on the storage server needs access to:
 
 - `zpool`, `zfs` - ZFS status commands
 - `systemctl` - Service status (read-only)
-- `smbstatus` - May require membership in `sambashare` group
+- `smbstatus` - SMB connection details (may require `sambashare` group)
+- `testparm` - SMB share configuration
 - `/proc/loadavg`, `/proc/meminfo` - System stats (world-readable)
 - `ss` - Socket statistics for NFS connections (with `-i` for extended metrics)
 - `/etc/exports` - NFS export configuration (world-readable)
