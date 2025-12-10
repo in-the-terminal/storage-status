@@ -373,25 +373,42 @@ class StorageStatus:
 
     def get_zpool_status(self) -> Dict[str, Any]:
         """
-        Get ZFS pool status information.
+        Get ZFS pool status information with detailed properties.
 
         Returns:
-            Dictionary with pool information
+            Dictionary with pool information including:
+            - name: Pool name
+            - size: Total size
+            - alloc: Allocated space
+            - free: Free space
+            - capacity: Usage percentage
+            - health: Pool health status
+            - dedup: Deduplication ratio
+            - frag: Fragmentation percentage
+            - read_errors: Total read errors across all vdevs
+            - write_errors: Total write errors across all vdevs
+            - cksum_errors: Total checksum errors across all vdevs
+            - scan: Current scan status (scrub/resilver)
+            - topology: List of vdevs with their devices
         """
         pools = []
 
-        # Get pool list
-        success, output = self.runner.run("zpool list -H -o name,size,alloc,free,cap,health,dedup")
+        # Get pool list with fragmentation
+        success, output = self.runner.run(
+            "zpool list -H -o name,size,alloc,free,cap,health,dedup,frag"
+        )
         if not success:
             return {'error': output, 'pools': []}
 
+        pool_names = []
         for line in output.strip().split('\n'):
             if not line:
                 continue
             parts = line.split('\t')
-            if len(parts) >= 7:
+            if len(parts) >= 8:
                 cap = parts[4].replace('%', '')
-                pools.append({
+                frag = parts[7].replace('%', '').replace('-', '0')
+                pool_info = {
                     'name': parts[0],
                     'size': parts[1],
                     'alloc': parts[2],
@@ -399,9 +416,217 @@ class StorageStatus:
                     'capacity': float(cap) if cap.isdigit() else 0,
                     'health': parts[5],
                     'dedup': parts[6],
-                })
+                    'frag': float(frag) if frag.replace('.', '').isdigit() else 0,
+                    'read_errors': 0,
+                    'write_errors': 0,
+                    'cksum_errors': 0,
+                    'scan': None,
+                    'topology': [],
+                }
+                pools.append(pool_info)
+                pool_names.append(parts[0])
+
+        # Get detailed status for each pool (topology, errors, scan)
+        for pool in pools:
+            topology, errors, scan = self._parse_pool_status(pool['name'])
+            pool['topology'] = topology
+            pool['read_errors'] = errors.get('read', 0)
+            pool['write_errors'] = errors.get('write', 0)
+            pool['cksum_errors'] = errors.get('cksum', 0)
+            pool['scan'] = scan
+
+        # Get vdev sizes from zpool list -v
+        vdev_sizes = self._get_vdev_sizes()
+        for pool in pools:
+            for vdev in pool.get('topology', []):
+                vdev_name = vdev.get('name', '')
+                if vdev_name in vdev_sizes:
+                    vdev['size'] = vdev_sizes[vdev_name].get('size')
+                    vdev['alloc'] = vdev_sizes[vdev_name].get('alloc')
+                # Also check devices for single-disk vdevs
+                for device in vdev.get('devices', []):
+                    dev_name = device.get('name', '')
+                    if dev_name in vdev_sizes:
+                        device['size'] = vdev_sizes[dev_name].get('size')
 
         return {'pools': pools}
+
+    def _get_vdev_sizes(self) -> Dict[str, Dict[str, str]]:
+        """
+        Get vdev and device sizes from zpool list -v.
+
+        Returns:
+            Dictionary mapping vdev/device names to their size info
+        """
+        sizes = {}
+
+        success, output = self.runner.run("zpool list -v -H -p 2>/dev/null")
+        if not success:
+            # Try without -p (parseable) flag for older ZFS versions
+            success, output = self.runner.run("zpool list -v 2>/dev/null")
+            if not success:
+                return sizes
+
+        for line in output.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split()
+            # Format varies but generally: NAME SIZE ALLOC FREE ...
+            # or with -H: name\tsize\talloc\tfree\t...
+            if '\t' in line:
+                parts = line.split('\t')
+
+            if len(parts) >= 4:
+                name = parts[0].strip()
+                # Skip pool names (they appear without indentation)
+                if name and not line.startswith(name):
+                    # This is a vdev or device (indented)
+                    size = parts[1] if len(parts) > 1 else None
+                    alloc = parts[2] if len(parts) > 2 else None
+                    # Convert bytes to human-readable if -p was used
+                    if size and size.isdigit():
+                        size = self._bytes_to_human(int(size))
+                    if alloc and alloc.isdigit():
+                        alloc = self._bytes_to_human(int(alloc))
+                    sizes[name] = {'size': size, 'alloc': alloc}
+
+        return sizes
+
+    def _bytes_to_human(self, bytes_val: int) -> str:
+        """
+        Convert bytes to human-readable format.
+
+        Args:
+            bytes_val: Size in bytes
+
+        Returns:
+            Human-readable size string (e.g., '1.5T', '500G')
+        """
+        for unit in ['B', 'K', 'M', 'G', 'T', 'P']:
+            if abs(bytes_val) < 1024.0:
+                if unit == 'B':
+                    return f"{int(bytes_val)}{unit}"
+                return f"{bytes_val:.1f}{unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.1f}E"
+
+    def _parse_pool_status(self, pool_name: str) -> Tuple[List[Dict], Dict[str, int], Optional[str]]:
+        """
+        Parse zpool status output for topology, errors, and scan status.
+
+        Args:
+            pool_name: Name of the pool to query
+
+        Returns:
+            Tuple of (topology list, error counts dict, scan status string)
+        """
+        topology = []
+        errors = {'read': 0, 'write': 0, 'cksum': 0}
+        scan = None
+
+        success, output = self.runner.run(f"zpool status {pool_name}")
+        if not success:
+            return topology, errors, scan
+
+        lines = output.strip().split('\n')
+        in_config = False
+        current_vdev = None
+
+        for line in lines:
+            # Parse scan status
+            if line.strip().startswith('scan:'):
+                scan_text = line.split(':', 1)[1].strip()
+                # Simplify scan status
+                if 'scrub in progress' in scan_text:
+                    # Extract progress percentage if available
+                    match = re.search(r'(\d+\.?\d*)%', scan_text)
+                    if match:
+                        scan = f"scrub {match.group(1)}%"
+                    else:
+                        scan = "scrub in progress"
+                elif 'resilver in progress' in scan_text:
+                    match = re.search(r'(\d+\.?\d*)%', scan_text)
+                    if match:
+                        scan = f"resilver {match.group(1)}%"
+                    else:
+                        scan = "resilver in progress"
+                elif 'scrub repaired' in scan_text or 'scrub canceled' in scan_text:
+                    scan = "scrub completed"
+                elif 'resilvered' in scan_text:
+                    scan = "resilver completed"
+                continue
+
+            # Detect config section
+            if line.strip() == 'config:':
+                in_config = True
+                continue
+
+            if not in_config:
+                continue
+
+            # Skip header line
+            if 'NAME' in line and 'STATE' in line:
+                continue
+
+            # Skip empty lines and errors section
+            if not line.strip() or line.strip().startswith('errors:'):
+                continue
+
+            # Parse device/vdev lines
+            # Format: "	NAME                      STATE     READ WRITE CKSUM"
+            parts = line.split()
+            if len(parts) >= 5:
+                name = parts[0]
+                state = parts[1]
+                try:
+                    read_err = int(parts[2]) if parts[2].isdigit() else 0
+                    write_err = int(parts[3]) if parts[3].isdigit() else 0
+                    cksum_err = int(parts[4]) if parts[4].isdigit() else 0
+                except (ValueError, IndexError):
+                    read_err = write_err = cksum_err = 0
+
+                # Accumulate errors
+                errors['read'] += read_err
+                errors['write'] += write_err
+                errors['cksum'] += cksum_err
+
+                # Determine indent level (vdev vs device)
+                indent = len(line) - len(line.lstrip())
+
+                # Pool name is at indent 1, vdevs at 2, devices at 3+
+                if indent <= 8:  # vdev level (mirror, raidz, etc.)
+                    if name != pool_name:  # Skip pool name itself
+                        current_vdev = {
+                            'name': name,
+                            'state': state,
+                            'devices': [],
+                            'read_errors': read_err,
+                            'write_errors': write_err,
+                            'cksum_errors': cksum_err,
+                        }
+                        topology.append(current_vdev)
+                else:  # device level
+                    device = {
+                        'name': name,
+                        'state': state,
+                        'read_errors': read_err,
+                        'write_errors': write_err,
+                        'cksum_errors': cksum_err,
+                    }
+                    if current_vdev:
+                        current_vdev['devices'].append(device)
+                    else:
+                        # Single disk pool (no vdev grouping)
+                        topology.append({
+                            'name': name,
+                            'state': state,
+                            'devices': [],
+                            'read_errors': read_err,
+                            'write_errors': write_err,
+                            'cksum_errors': cksum_err,
+                        })
+
+        return topology, errors, scan
 
     def get_dataset_usage(self) -> Dict[str, Any]:
         """
@@ -1671,6 +1896,234 @@ def _format_runtime(seconds: Optional[int]) -> str:
         return f"{days}d {hours}h"
 
 
+def create_expanded_pools_view(pool_data: Dict[str, Any], mode: str) -> Layout:
+    """
+    Create a full-screen expanded view of ZFS pools with two sections:
+    pool summary on top, vdev/disk topology below.
+
+    Args:
+        pool_data: Pool information from get_zpool_status()
+        mode: 'local' or 'remote'
+
+    Returns:
+        Rich Layout with expanded pools view
+    """
+    layout = Layout()
+
+    # Header
+    mode_text = "Local" if mode == 'local' else f"Remote ({SSH_HOST})"
+    header = Panel(
+        Text(f"ZFS Pools - {mode_text} - {datetime.now().strftime('%H:%M:%S')}",
+             justify="center", style="bold"),
+        box=box.ROUNDED
+    )
+
+    pools = pool_data.get('pools', [])
+
+    # Section 1: Pool Summary
+    if not pools:
+        summary_panel = Panel(
+            Text("No ZFS pools found", style="dim", justify="center"),
+            title="[bold blue]Pool Summary (0)[/bold blue]",
+            box=box.ROUNDED
+        )
+    else:
+        summary_table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        summary_table.add_column("#", style="dim", width=3)
+        summary_table.add_column("Pool", style="cyan", no_wrap=True)
+        summary_table.add_column("Size", justify="right", width=8)
+        summary_table.add_column("Alloc", justify="right", width=8)
+        summary_table.add_column("Free", justify="right", width=8)
+        summary_table.add_column("Cap", justify="right", width=5)
+        summary_table.add_column("Frag", justify="right", width=5)
+        summary_table.add_column("Dedup", justify="right", width=6)
+        summary_table.add_column("Health", width=10)
+        summary_table.add_column("Errors", justify="right", width=8)
+        summary_table.add_column("Scan", style="dim")
+
+        for idx, pool in enumerate(pools, 1):
+            # Format capacity with color
+            cap = pool.get('capacity', 0)
+            cap_str = f"{int(cap)}%"
+            if cap >= 90:
+                cap_text = Text(cap_str, style="red")
+            elif cap >= 75:
+                cap_text = Text(cap_str, style="yellow")
+            else:
+                cap_text = Text(cap_str, style="green")
+
+            # Format fragmentation
+            frag = pool.get('frag', 0)
+            frag_str = f"{int(frag)}%"
+            if frag >= 50:
+                frag_text = Text(frag_str, style="yellow")
+            else:
+                frag_text = Text(frag_str, style="dim")
+
+            # Format health with color
+            health = pool.get('health', 'UNKNOWN')
+            if health == 'ONLINE':
+                health_text = Text(health, style="green")
+            elif health == 'DEGRADED':
+                health_text = Text(health, style="yellow")
+            elif health in ('FAULTED', 'OFFLINE', 'UNAVAIL'):
+                health_text = Text(health, style="red")
+            else:
+                health_text = Text(health, style="dim")
+
+            # Format errors
+            total_errors = (pool.get('read_errors', 0) +
+                          pool.get('write_errors', 0) +
+                          pool.get('cksum_errors', 0))
+            if total_errors > 0:
+                errors_text = Text(str(total_errors), style="red")
+            else:
+                errors_text = Text("0", style="dim")
+
+            # Format scan status
+            scan = pool.get('scan') or '-'
+
+            summary_table.add_row(
+                str(idx),
+                pool.get('name', '-'),
+                pool.get('size', '-'),
+                pool.get('alloc', '-'),
+                pool.get('free', '-'),
+                cap_text,
+                frag_text,
+                pool.get('dedup', '-'),
+                health_text,
+                errors_text,
+                scan,
+            )
+
+        summary_panel = Panel(
+            summary_table,
+            title=f"[bold blue]Pool Summary ({len(pools)})[/bold blue]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Section 2: Vdev Topology
+    topology_content = []
+    for pool in pools:
+        pool_name = pool.get('name', 'unknown')
+        topology = pool.get('topology', [])
+
+        if not topology:
+            topology_content.append(Text(f"  {pool_name}: No vdev information", style="dim"))
+            continue
+
+        # Pool header with total size
+        pool_size = pool.get('size', '')
+        pool_header = f"  {pool_name}"
+        if pool_size:
+            pool_header += f" [dim]({pool_size})[/dim]"
+        topology_content.append(Text.from_markup(f"[bold cyan]{pool_header}[/bold cyan]"))
+
+        for vdev in topology:
+            vdev_name = vdev.get('name', 'unknown')
+            vdev_state = vdev.get('state', 'UNKNOWN')
+            vdev_size = vdev.get('size')
+            devices = vdev.get('devices', [])
+
+            # Format vdev state
+            if vdev_state == 'ONLINE':
+                state_style = "green"
+            elif vdev_state == 'DEGRADED':
+                state_style = "yellow"
+            else:
+                state_style = "red"
+
+            # Format vdev errors
+            vdev_errors = (vdev.get('read_errors', 0) +
+                         vdev.get('write_errors', 0) +
+                         vdev.get('cksum_errors', 0))
+            error_suffix = f" [red]({vdev_errors} errors)[/red]" if vdev_errors > 0 else ""
+
+            # Format size info for vdev
+            size_info = f" [dim]{vdev_size}[/dim]" if vdev_size else ""
+
+            if devices:
+                # This is a vdev group (mirror, raidz, etc.)
+                # Determine vdev type from name (mirror-0, raidz1-0, etc.)
+                vdev_type = vdev_name.split('-')[0] if '-' in vdev_name else vdev_name
+                topology_content.append(Text.from_markup(
+                    f"    ├─ {vdev_name} [bold]{vdev_type.upper()}[/bold]{size_info} [{state_style}]{vdev_state}[/{state_style}]{error_suffix}"
+                ))
+                for i, device in enumerate(devices):
+                    dev_name = device.get('name', 'unknown')
+                    dev_state = device.get('state', 'UNKNOWN')
+                    dev_size = device.get('size')
+                    dev_errors = (device.get('read_errors', 0) +
+                                device.get('write_errors', 0) +
+                                device.get('cksum_errors', 0))
+
+                    if dev_state == 'ONLINE':
+                        dev_style = "green"
+                    elif dev_state == 'DEGRADED':
+                        dev_style = "yellow"
+                    else:
+                        dev_style = "red"
+
+                    prefix = "│     └─" if i == len(devices) - 1 else "│     ├─"
+                    error_info = f" [red]({dev_errors} errors)[/red]" if dev_errors > 0 else ""
+                    dev_size_info = f" [dim]{dev_size}[/dim]" if dev_size else ""
+                    topology_content.append(Text.from_markup(
+                        f"    {prefix} {dev_name}{dev_size_info} [{dev_style}]{dev_state}[/{dev_style}]{error_info}"
+                    ))
+            else:
+                # Single disk (no children) - show as DISK type
+                dev_size_info = f" [dim]{vdev_size}[/dim]" if vdev_size else ""
+                topology_content.append(Text.from_markup(
+                    f"    └─ {vdev_name} [bold]DISK[/bold]{dev_size_info} [{state_style}]{vdev_state}[/{state_style}]{error_suffix}"
+                ))
+
+        topology_content.append(Text(""))  # Blank line between pools
+
+    if topology_content:
+        # Remove trailing blank line
+        if topology_content and str(topology_content[-1]) == "":
+            topology_content.pop()
+        topology_text = Text()
+        for line in topology_content:
+            topology_text.append(line)
+            topology_text.append("\n")
+        topology_panel = Panel(
+            topology_text,
+            title="[bold blue]Vdev Topology[/bold blue]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+    else:
+        topology_panel = Panel(
+            Text("No topology information available", style="dim", justify="center"),
+            title="[bold blue]Vdev Topology[/bold blue]",
+            box=box.ROUNDED
+        )
+
+    # Footer
+    footer = Panel(
+        Text("[Esc] Back | [q] Quit", justify="center", style="dim"),
+        box=box.ROUNDED
+    )
+
+    # Arrange layout with two sections
+    layout.split_column(
+        Layout(header, name="header", size=3),
+        Layout(name="body"),
+        Layout(footer, name="footer", size=3)
+    )
+
+    # Split body into two sections (summary on top, topology below)
+    layout["body"].split_column(
+        Layout(summary_panel, name="summary"),
+        Layout(topology_panel, name="topology"),
+    )
+
+    return layout
+
+
 def create_expanded_datasets_view(
     dataset_data: Dict[str, Any],
     mode: str,
@@ -2431,7 +2884,11 @@ def create_view(
             mode,
             scroll_offset=scroll_offset
         )
-    # Future expanded views: pools
+    elif current_view == 'pools':
+        return create_expanded_pools_view(
+            cached_data['pool'],
+            mode
+        )
 
     # Default: main dashboard
     return create_dashboard_from_cache(cached_data, mode, show_smb)
@@ -2645,7 +3102,10 @@ def main():
                 key = keyboard.get_key()
                 if key:
                     # Number keys for expanded views (only on dashboard)
-                    if current_view == 'dashboard' and key == '2':
+                    if current_view == 'dashboard' and key == '1':
+                        current_view = 'pools'
+                        scroll_offset = 0  # Reset scroll on view change
+                    elif current_view == 'dashboard' and key == '2':
                         current_view = 'datasets'
                         scroll_offset = 0  # Reset scroll on view change
                     elif current_view == 'dashboard' and key == '3':
@@ -2660,7 +3120,6 @@ def main():
                     elif current_view == 'dashboard' and key == '6':
                         current_view = 'nfs'
                         scroll_offset = 0  # Reset scroll on view change
-                    # Future: add key 1 for pools
 
                     # Scroll up (arrow up or k for vim-style)
                     elif current_view in ('nfs', 'datasets') and (key == 'UP' or key == 'k'):

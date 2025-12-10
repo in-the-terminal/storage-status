@@ -35,7 +35,7 @@ When running in live mode (without \fB\-\-once\fR):
 .B 1\-6
 Expand the corresponding panel to full screen.
 Panel numbers are shown in the panel titles.
-Currently implemented: \fB2\fR for ZFS Datasets, \fB3\fR for Services details, \fB4\fR for Network details, \fB5\fR for SMB details, \fB6\fR for NFS details.
+All panels implemented: \fB1\fR for ZFS Pools, \fB2\fR for ZFS Datasets, \fB3\fR for Services, \fB4\fR for Network, \fB5\fR for SMB, \fB6\fR for NFS.
 .TP
 .B Esc / Backspace
 Return to the main dashboard from an expanded view.
@@ -87,6 +87,16 @@ Lists network interfaces with their state (UP/DOWN) and IP addresses.
 Toggleable panel showing either SMB connections (user and machine) or NFS connections
 (client IP addresses). Press \fBt\fR to toggle. The panel title shows counts for both.
 Multiple connections from the same client are deduplicated with a count suffix (e.g., "x2").
+.SS ZFS Pools Expanded View
+Press \fB1\fR to view detailed ZFS pool information in two sections:
+.RS
+.IP \(bu 2
+\fBPool Summary\fR \- Table showing pool name, size, allocated, free, capacity percentage,
+fragmentation, dedup ratio, health status, error counts, and scan status (scrub/resilver).
+.IP \(bu 2
+\fBVdev Topology\fR \- Tree view of vdevs (mirror, raidz, etc.) and their underlying
+devices with state and per-device error counts.
+.RE
 .SS ZFS Datasets Expanded View
 Press \fB2\fR to view detailed ZFS dataset information in a comprehensive table:
 .RS
