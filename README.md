@@ -2,7 +2,7 @@
 
 Terminal dashboard for monitoring Ubuntu/ZFS storage servers. Displays real-time ZFS pool health, dataset usage, system resources, services, and network information.
 
-Last Updated On: 2025-12-08
+Last Updated On: 2025-12-09
 
 ## Features
 
@@ -67,9 +67,11 @@ In live mode (without `--once`):
 | `1` | Expand ZFS Pools (coming soon) |
 | `2` | Expand ZFS Datasets (coming soon) |
 | `3` | Expand Services (coming soon) |
-| `4` | Expand Network Interfaces (coming soon) |
+| `4` | Expand Network Interfaces (details + traffic stats) |
 | `5` | Expand SMB Details (connections + shares) |
 | `6` | Expand NFS Details (connections + exports) |
+| `↑` / `k` | Scroll up in expanded views |
+| `↓` / `j` | Scroll down in expanded views |
 | `Esc` / `Backspace` | Return to main dashboard |
 | `t` / `Tab` | Toggle between SMB and NFS connections |
 | `q` / `Ctrl+C` | Quit |

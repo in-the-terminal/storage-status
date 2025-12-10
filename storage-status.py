@@ -11,7 +11,7 @@ Usage:
     storage-status datasets     - Show only ZFS datasets
     storage-status services     - Show only service status
 
-Last Updated On: 2025-12-08
+Last Updated On: 2025-12-09
 """
 
 import argparse
@@ -74,14 +74,61 @@ class KeyboardListener:
 
     def _listen(self):
         """Background thread that listens for keypresses."""
+        escape_buffer = ""
+        escape_timeout = None
+
         while self.running:
-            if select.select([sys.stdin], [], [], 0.1)[0]:
+            # If we have a pending escape sequence, use short timeout
+            timeout = 0.02 if escape_buffer else 0.1
+
+            if select.select([sys.stdin], [], [], timeout)[0]:
                 try:
-                    key = sys.stdin.read(1)
-                    with self.lock:
-                        self.last_key = key
+                    char = sys.stdin.read(1)
+
+                    if escape_buffer:
+                        # We're in the middle of an escape sequence
+                        escape_buffer += char
+
+                        # Check if we have a complete arrow key sequence
+                        if len(escape_buffer) >= 3 and escape_buffer[1] == '[':
+                            key = None
+                            if escape_buffer[2] == 'A':
+                                key = 'UP'
+                            elif escape_buffer[2] == 'B':
+                                key = 'DOWN'
+                            elif escape_buffer[2] == 'C':
+                                key = 'RIGHT'
+                            elif escape_buffer[2] == 'D':
+                                key = 'LEFT'
+
+                            if key:
+                                with self.lock:
+                                    self.last_key = key
+                            escape_buffer = ""
+                            escape_timeout = None
+                        elif len(escape_buffer) >= 3:
+                            # Unknown escape sequence, discard
+                            escape_buffer = ""
+                            escape_timeout = None
+                    elif char == '\x1b':
+                        # Start of escape sequence
+                        escape_buffer = char
+                        escape_timeout = time.time() + 0.1  # 100ms to complete
+                    else:
+                        # Regular key
+                        with self.lock:
+                            self.last_key = char
                 except Exception:
-                    pass
+                    escape_buffer = ""
+                    escape_timeout = None
+            elif escape_buffer:
+                # Timeout while waiting for escape sequence
+                if escape_timeout and time.time() > escape_timeout:
+                    # Treat as standalone Escape key
+                    with self.lock:
+                        self.last_key = '\x1b'
+                    escape_buffer = ""
+                    escape_timeout = None
 
     def get_key(self) -> Optional[str]:
         """
@@ -460,17 +507,27 @@ class StorageStatus:
 
     def get_network_stats(self) -> Dict[str, Any]:
         """
-        Get network interface statistics.
+        Get network interface statistics including speed, MAC, MTU, and traffic.
 
         Returns:
-            Dictionary with network interface information
+            Dictionary with network interface information:
+            - name: Interface name
+            - state: UP/DOWN
+            - ips: List of IP addresses
+            - speed: Link speed in Mbps (e.g., 10000 for 10G)
+            - mac: MAC address
+            - mtu: Maximum transmission unit
+            - rx_bytes, rx_packets, rx_errors, rx_dropped: Receive stats
+            - tx_bytes, tx_packets, tx_errors, tx_dropped: Transmit stats
         """
         interfaces = []
 
+        # Get basic interface info (name, state, IPs)
         success, output = self.runner.run("ip -br addr | grep -v '^lo'")
         if not success:
             return {'error': output, 'interfaces': []}
 
+        interface_names = []
         for line in output.strip().split('\n'):
             if not line:
                 continue
@@ -480,10 +537,102 @@ class StorageStatus:
                     'name': parts[0],
                     'state': parts[1],
                     'ips': parts[2:] if len(parts) > 2 else [],
+                    'speed': None,
+                    'mac': None,
+                    'mtu': None,
+                    'rx_bytes': 0,
+                    'rx_packets': 0,
+                    'rx_errors': 0,
+                    'rx_dropped': 0,
+                    'tx_bytes': 0,
+                    'tx_packets': 0,
+                    'tx_errors': 0,
+                    'tx_dropped': 0,
                 }
                 interfaces.append(iface)
+                interface_names.append(parts[0])
+
+        # Get detailed stats for each interface using ip -s link
+        success, output = self.runner.run("ip -s link show 2>/dev/null")
+        if success and output.strip():
+            self._parse_link_stats(output, interfaces)
+
+        # Get speed for each interface from sysfs
+        for iface in interfaces:
+            name = iface['name']
+            success, speed = self.runner.run(f"cat /sys/class/net/{name}/speed 2>/dev/null")
+            if success and speed.strip().isdigit():
+                iface['speed'] = int(speed.strip())
 
         return {'interfaces': interfaces}
+
+    def _parse_link_stats(self, output: str, interfaces: List[Dict[str, Any]]) -> None:
+        """
+        Parse ip -s link output to extract MAC, MTU, and traffic statistics.
+
+        Args:
+            output: Output from ip -s link show
+            interfaces: List of interface dicts to update in place
+        """
+        # Create lookup by interface name
+        iface_lookup = {iface['name']: iface for iface in interfaces}
+
+        current_iface = None
+        lines = output.strip().split('\n')
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+
+            # Interface line: "2: eno1: <...> mtu 1500 ..."
+            if line and line[0].isdigit() and ':' in line:
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    name = parts[1].strip().split('@')[0]  # Handle veth@if... names
+                    if name in iface_lookup:
+                        current_iface = iface_lookup[name]
+                        # Extract MTU from this line
+                        mtu_match = re.search(r'mtu (\d+)', line)
+                        if mtu_match:
+                            current_iface['mtu'] = int(mtu_match.group(1))
+
+            # MAC address line: "    link/ether 00:10:9b:20:c9:2a ..."
+            elif current_iface and 'link/ether' in line:
+                mac_match = re.search(r'link/ether ([0-9a-f:]+)', line)
+                if mac_match:
+                    current_iface['mac'] = mac_match.group(1)
+
+            # RX stats line (after "RX:" header)
+            elif current_iface and line.strip().startswith('RX:'):
+                # Next line has the actual values
+                if i + 1 < len(lines):
+                    i += 1
+                    values = lines[i].split()
+                    if len(values) >= 4:
+                        try:
+                            current_iface['rx_bytes'] = int(values[0])
+                            current_iface['rx_packets'] = int(values[1])
+                            current_iface['rx_errors'] = int(values[2])
+                            current_iface['rx_dropped'] = int(values[3])
+                        except (ValueError, IndexError):
+                            pass
+
+            # TX stats line (after "TX:" header)
+            elif current_iface and line.strip().startswith('TX:'):
+                # Next line has the actual values
+                if i + 1 < len(lines):
+                    i += 1
+                    values = lines[i].split()
+                    if len(values) >= 4:
+                        try:
+                            current_iface['tx_bytes'] = int(values[0])
+                            current_iface['tx_packets'] = int(values[1])
+                            current_iface['tx_errors'] = int(values[2])
+                            current_iface['tx_dropped'] = int(values[3])
+                        except (ValueError, IndexError):
+                            pass
+
+            i += 1
 
     def get_smb_connections(self) -> Dict[str, Any]:
         """
@@ -1321,7 +1470,163 @@ def _format_client_display(ip: str, hostname: Optional[str], ip_width: int = 15)
     return ip
 
 
-def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, Any], mode: str) -> Layout:
+def _format_speed(speed: Optional[int]) -> str:
+    """
+    Format link speed in Mbps to human-readable format.
+
+    Args:
+        speed: Link speed in Mbps (e.g., 10000 for 10G)
+
+    Returns:
+        Formatted speed string (e.g., '10G', '1G', '100M')
+    """
+    if speed is None or speed < 0:
+        return '-'
+    if speed >= 1000:
+        return f"{speed // 1000}G"
+    return f"{speed}M"
+
+
+def _format_traffic_bytes(bytes_val: Optional[int]) -> str:
+    """
+    Format traffic bytes to human-readable format.
+
+    Args:
+        bytes_val: Bytes value as integer
+
+    Returns:
+        Human-readable size string (e.g., '1.5 GB')
+    """
+    if bytes_val is None:
+        return '-'
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(bytes_val) < 1024.0:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.1f} PB"
+
+
+def create_expanded_network_view(network_data: Dict[str, Any], mode: str) -> Layout:
+    """
+    Create a full-screen expanded view of network interfaces with a single
+    comprehensive table showing interface details and traffic statistics.
+
+    Args:
+        network_data: Network interface information from get_network_stats()
+        mode: 'local' or 'remote'
+
+    Returns:
+        Rich Layout with expanded network view
+    """
+    layout = Layout()
+
+    # Header
+    mode_text = "Local" if mode == 'local' else f"Remote ({SSH_HOST})"
+    header = Panel(
+        Text(f"Network Interfaces - {mode_text} - {datetime.now().strftime('%H:%M:%S')}",
+             justify="center", style="bold"),
+        box=box.ROUNDED
+    )
+
+    # Build interface table
+    interfaces = network_data.get('interfaces', [])
+
+    if not interfaces:
+        content_panel = Panel(
+            Text("No network interfaces found", style="dim", justify="center"),
+            title="[bold blue]Network Interfaces (0)[/bold blue]",
+            box=box.ROUNDED
+        )
+    else:
+        # Create comprehensive table with all info
+        table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+
+        # Interface identity columns
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Interface", style="cyan", no_wrap=True)
+        table.add_column("State", width=6)
+        table.add_column("Speed", justify="right", width=6)
+        table.add_column("MAC", style="dim", width=18)
+        table.add_column("MTU", justify="right", width=5)
+        table.add_column("IP Addresses", style="green")
+
+        # Traffic stats columns
+        table.add_column("RX", justify="right", width=10)
+        table.add_column("TX", justify="right", width=10)
+        table.add_column("Errors", justify="right", width=8)
+
+        for idx, iface in enumerate(interfaces, 1):
+            # Format state with color
+            state = iface.get('state', 'UNKNOWN')
+            if state == 'UP':
+                state_text = Text("UP", style="green")
+            elif state == 'DOWN':
+                state_text = Text("DOWN", style="red")
+            else:
+                state_text = Text(state, style="yellow")
+
+            # Format IP addresses (may have multiple)
+            ips = iface.get('ips', [])
+            # Strip CIDR notation for cleaner display
+            ip_list = [ip.split('/')[0] for ip in ips]
+            ip_display = ', '.join(ip_list) if ip_list else '-'
+
+            # Calculate total errors (RX + TX errors + dropped)
+            rx_errors = iface.get('rx_errors', 0) or 0
+            tx_errors = iface.get('tx_errors', 0) or 0
+            rx_dropped = iface.get('rx_dropped', 0) or 0
+            tx_dropped = iface.get('tx_dropped', 0) or 0
+            total_errors = rx_errors + tx_errors + rx_dropped + tx_dropped
+
+            # Format errors with color if non-zero
+            if total_errors > 0:
+                error_text = Text(str(total_errors), style="red")
+            else:
+                error_text = Text("0", style="dim")
+
+            table.add_row(
+                str(idx),
+                iface.get('name', '-'),
+                state_text,
+                _format_speed(iface.get('speed')),
+                iface.get('mac', '-') or '-',
+                str(iface.get('mtu', '-')) if iface.get('mtu') else '-',
+                ip_display,
+                _format_traffic_bytes(iface.get('rx_bytes')),
+                _format_traffic_bytes(iface.get('tx_bytes')),
+                error_text,
+            )
+
+        content_panel = Panel(
+            table,
+            title=f"[bold blue]Network Interfaces ({len(interfaces)})[/bold blue]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Footer
+    footer = Panel(
+        Text("[Esc] Back | [q] Quit", justify="center", style="dim"),
+        box=box.ROUNDED
+    )
+
+    # Arrange layout - single content section (no split)
+    layout.split_column(
+        Layout(header, name="header", size=3),
+        Layout(content_panel, name="body"),
+        Layout(footer, name="footer", size=3)
+    )
+
+    return layout
+
+
+def create_expanded_nfs_view(
+    nfs_data: Dict[str, Any],
+    nfs_exports: Dict[str, Any],
+    mode: str,
+    scroll_offset: int = 0,
+    page_size: int = 12
+) -> Layout:
     """
     Create a full-screen expanded view of NFS connections with two sections:
     active TCP connections and configured exports.
@@ -1330,6 +1635,8 @@ def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, An
         nfs_data: NFS connection information from get_nfs_connections()
         nfs_exports: NFS export configuration from get_nfs_exports()
         mode: 'local' or 'remote'
+        scroll_offset: Starting index for connection display (for pagination)
+        page_size: Number of connections to display per page
 
     Returns:
         Rich Layout with expanded NFS view
@@ -1346,6 +1653,7 @@ def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, An
 
     # Section 1: Active TCP Connections
     connections = nfs_data.get('connections', [])
+    total_connections = len(connections)
 
     if not connections:
         conn_panel = Panel(
@@ -1363,7 +1671,10 @@ def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, An
         conn_table.add_column("RTT", justify="right", width=10)
         conn_table.add_column("Last Activity", justify="right", width=12)
 
-        for idx, conn in enumerate(connections, 1):
+        # Apply pagination - show only a window of connections
+        visible_connections = connections[scroll_offset:scroll_offset + page_size]
+
+        for idx, conn in enumerate(visible_connections, scroll_offset + 1):
             # Display IP first with consistent spacing, then hostname
             hostname = conn.get('hostname')
             ip = conn.get('ip', 'unknown')
@@ -1393,9 +1704,20 @@ def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, An
                 last_activity,
             )
 
+        # Build title with scroll indicator if needed
+        if total_connections > page_size:
+            end_idx = min(scroll_offset + page_size, total_connections)
+            scroll_indicator = f" [{scroll_offset + 1}-{end_idx} of {total_connections}]"
+            # Add arrow hints
+            up_arrow = "↑" if scroll_offset > 0 else " "
+            down_arrow = "↓" if scroll_offset + page_size < total_connections else " "
+            title = f"[bold blue]Active Connections ({total_connections}){scroll_indicator} {up_arrow}{down_arrow}[/bold blue]"
+        else:
+            title = f"[bold blue]Active Connections ({total_connections})[/bold blue]"
+
         conn_panel = Panel(
             conn_table,
-            title=f"[bold blue]Active Connections ({len(connections)})[/bold blue]",
+            title=title,
             box=box.ROUNDED,
             padding=(0, 1)
         )
@@ -1441,9 +1763,14 @@ def create_expanded_nfs_view(nfs_data: Dict[str, Any], nfs_exports: Dict[str, An
             padding=(0, 1)
         )
 
-    # Footer
+    # Footer with scroll controls if there are more connections than page size
+    if total_connections > page_size:
+        footer_text = "[↑/↓] Scroll | [Esc] Back | [q] Quit"
+    else:
+        footer_text = "[Esc] Back | [q] Quit"
+
     footer = Panel(
-        Text("[Esc] Back | [q] Quit", justify="center", style="dim"),
+        Text(footer_text, justify="center", style="dim"),
         box=box.ROUNDED
     )
 
@@ -1583,7 +1910,13 @@ def create_expanded_smb_view(smb_data: Dict[str, Any], smb_shares: Dict[str, Any
     return layout
 
 
-def create_view(current_view: str, cached_data: Dict[str, Any], mode: str, show_smb: bool) -> Layout:
+def create_view(
+    current_view: str,
+    cached_data: Dict[str, Any],
+    mode: str,
+    show_smb: bool,
+    scroll_offset: int = 0
+) -> Layout:
     """
     Route to appropriate view based on current_view state.
 
@@ -1592,6 +1925,7 @@ def create_view(current_view: str, cached_data: Dict[str, Any], mode: str, show_
         cached_data: Pre-fetched data dictionary
         mode: 'local' or 'remote'
         show_smb: If True, show SMB in connections panel; if False, show NFS
+        scroll_offset: Scroll position for paginated views
 
     Returns:
         Rich Layout for the requested view
@@ -1600,7 +1934,8 @@ def create_view(current_view: str, cached_data: Dict[str, Any], mode: str, show_
         return create_expanded_nfs_view(
             cached_data['nfs'],
             cached_data.get('nfs_exports', {'exports': []}),
-            mode
+            mode,
+            scroll_offset=scroll_offset
         )
     elif current_view == 'smb':
         return create_expanded_smb_view(
@@ -1608,7 +1943,12 @@ def create_view(current_view: str, cached_data: Dict[str, Any], mode: str, show_
             cached_data.get('smb_shares', {'shares': []}),
             mode
         )
-    # Future expanded views: pools, datasets, services, network
+    elif current_view == 'network':
+        return create_expanded_network_view(
+            cached_data['network'],
+            mode
+        )
+    # Future expanded views: pools, datasets, services
 
     # Default: main dashboard
     return create_dashboard_from_cache(cached_data, mode, show_smb)
@@ -1798,6 +2138,8 @@ def main():
     try:
         show_smb = True  # Toggle state for SMB/NFS panel
         current_view = 'dashboard'  # View state: 'dashboard', 'nfs', etc.
+        scroll_offset = 0  # Scroll position for paginated views
+        page_size = 12  # Number of items per page (matches create_expanded_nfs_view default)
         keyboard.start()
 
         # Start background data fetcher
@@ -1813,22 +2155,39 @@ def main():
                 # Build and display view from cached data
                 with data_lock:
                     current_data = cached_data.copy()
-                view = create_view(current_view, current_data, mode, show_smb)
+                view = create_view(current_view, current_data, mode, show_smb, scroll_offset)
                 live.update(view)
 
                 # Check for keypress
                 key = keyboard.get_key()
                 if key:
                     # Number keys for expanded views (only on dashboard)
-                    if current_view == 'dashboard' and key == '5':
+                    if current_view == 'dashboard' and key == '4':
+                        current_view = 'network'
+                        scroll_offset = 0  # Reset scroll on view change
+                    elif current_view == 'dashboard' and key == '5':
                         current_view = 'smb'
+                        scroll_offset = 0  # Reset scroll on view change
                     elif current_view == 'dashboard' and key == '6':
                         current_view = 'nfs'
-                    # Future: add keys 1-4 for other expanded views
+                        scroll_offset = 0  # Reset scroll on view change
+                    # Future: add keys 1-3 for pools, datasets, services
+
+                    # Scroll up (arrow up or k for vim-style)
+                    elif current_view == 'nfs' and (key == 'UP' or key == 'k'):
+                        scroll_offset = max(0, scroll_offset - 1)
+
+                    # Scroll down (arrow down or j for vim-style)
+                    elif current_view == 'nfs' and (key == 'DOWN' or key == 'j'):
+                        # Get total connections to prevent scrolling past end
+                        total = len(current_data.get('nfs', {}).get('connections', []))
+                        max_offset = max(0, total - page_size)
+                        scroll_offset = min(max_offset, scroll_offset + 1)
 
                     # Escape or Backspace to return to dashboard
                     elif key == '\x1b' or key == '\x7f':  # Esc or Backspace
                         current_view = 'dashboard'
+                        scroll_offset = 0  # Reset scroll when returning to dashboard
 
                     # Toggle SMB/NFS (only on dashboard)
                     elif current_view == 'dashboard' and (key.lower() == 't' or key == '\t'):
