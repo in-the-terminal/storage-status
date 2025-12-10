@@ -460,35 +460,54 @@ class StorageStatus:
         """
         sizes = {}
 
+        # Use -H for tab-separated, -p for parseable (bytes)
         success, output = self.runner.run("zpool list -v -H -p 2>/dev/null")
+        use_bytes = True
         if not success:
             # Try without -p (parseable) flag for older ZFS versions
             success, output = self.runner.run("zpool list -v 2>/dev/null")
+            use_bytes = False
             if not success:
                 return sizes
 
         for line in output.strip().split('\n'):
             if not line.strip():
                 continue
-            parts = line.split()
-            # Format varies but generally: NAME SIZE ALLOC FREE ...
-            # or with -H: name\tsize\talloc\tfree\t...
-            if '\t' in line:
-                parts = line.split('\t')
 
-            if len(parts) >= 4:
+            # Check if line is indented (vdev/device) vs pool name
+            # With -H, indented lines start with \t
+            # Without -H, indented lines start with spaces
+            is_indented = line.startswith('\t') or line.startswith('  ')
+
+            if not is_indented:
+                # This is a pool name line, skip it
+                continue
+
+            # Parse the line - with -H it's tab-separated
+            if '\t' in line:
+                parts = [p for p in line.split('\t') if p]  # Filter empty parts
+            else:
+                parts = line.split()
+
+            if len(parts) >= 2:
                 name = parts[0].strip()
-                # Skip pool names (they appear without indentation)
-                if name and not line.startswith(name):
-                    # This is a vdev or device (indented)
-                    size = parts[1] if len(parts) > 1 else None
-                    alloc = parts[2] if len(parts) > 2 else None
-                    # Convert bytes to human-readable if -p was used
+                size = parts[1] if len(parts) > 1 else None
+                alloc = parts[2] if len(parts) > 2 else None
+
+                # Convert bytes to human-readable if -p was used
+                if use_bytes:
                     if size and size.isdigit():
                         size = self._bytes_to_human(int(size))
                     if alloc and alloc.isdigit():
                         alloc = self._bytes_to_human(int(alloc))
-                    sizes[name] = {'size': size, 'alloc': alloc}
+
+                # Filter out '-' values
+                if size == '-':
+                    size = None
+                if alloc == '-':
+                    alloc = None
+
+                sizes[name] = {'size': size, 'alloc': alloc}
 
         return sizes
 
