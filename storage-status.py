@@ -1869,6 +1869,41 @@ def _format_speed(speed: Optional[int]) -> str:
     return f"{speed}M"
 
 
+def _count_pool_topology_lines(pool_data: Dict[str, Any]) -> int:
+    """
+    Count the number of lines in the pool topology display.
+
+    Args:
+        pool_data: Pool information from get_zpool_status()
+
+    Returns:
+        Total number of lines in topology section
+    """
+    count = 0
+    pools = pool_data.get('pools', [])
+
+    for pool in pools:
+        topology = pool.get('topology', [])
+        if not topology:
+            count += 1  # "No vdev information" line
+            continue
+
+        count += 1  # Pool header line
+
+        for vdev in topology:
+            count += 1  # Vdev line
+            devices = vdev.get('devices', [])
+            count += len(devices)  # Device lines
+
+        count += 1  # Blank line between pools (except last)
+
+    # Remove trailing blank line
+    if count > 0 and pools:
+        count -= 1
+
+    return count
+
+
 def _format_traffic_bytes(bytes_val: Optional[int]) -> str:
     """
     Format traffic bytes to human-readable format.
@@ -1915,7 +1950,12 @@ def _format_runtime(seconds: Optional[int]) -> str:
         return f"{days}d {hours}h"
 
 
-def create_expanded_pools_view(pool_data: Dict[str, Any], mode: str) -> Layout:
+def create_expanded_pools_view(
+    pool_data: Dict[str, Any],
+    mode: str,
+    scroll_offset: int = 0,
+    page_size: int = 15
+) -> Layout:
     """
     Create a full-screen expanded view of ZFS pools with two sections:
     pool summary on top, vdev/disk topology below.
@@ -1923,6 +1963,8 @@ def create_expanded_pools_view(pool_data: Dict[str, Any], mode: str) -> Layout:
     Args:
         pool_data: Pool information from get_zpool_status()
         mode: 'local' or 'remote'
+        scroll_offset: Starting line index for topology display (for pagination)
+        page_size: Number of topology lines to display per page
 
     Returns:
         Rich Layout with expanded pools view
@@ -2100,17 +2142,35 @@ def create_expanded_pools_view(pool_data: Dict[str, Any], mode: str) -> Layout:
 
         topology_content.append(Text(""))  # Blank line between pools
 
+    total_lines = len(topology_content)
+
     if topology_content:
-        # Remove trailing blank line
+        # Remove trailing blank line for counting
         if topology_content and str(topology_content[-1]) == "":
             topology_content.pop()
+            total_lines = len(topology_content)
+
+        # Apply pagination to topology
+        visible_lines = topology_content[scroll_offset:scroll_offset + page_size]
+
         topology_text = Text()
-        for line in topology_content:
+        for line in visible_lines:
             topology_text.append(line)
             topology_text.append("\n")
+
+        # Build title with scroll indicator if needed
+        if total_lines > page_size:
+            end_idx = min(scroll_offset + page_size, total_lines)
+            scroll_indicator = f" [{scroll_offset + 1}-{end_idx} of {total_lines}]"
+            up_arrow = "↑" if scroll_offset > 0 else " "
+            down_arrow = "↓" if scroll_offset + page_size < total_lines else " "
+            title = f"[bold blue]Vdev Topology{scroll_indicator} {up_arrow}{down_arrow}[/bold blue]"
+        else:
+            title = "[bold blue]Vdev Topology[/bold blue]"
+
         topology_panel = Panel(
             topology_text,
-            title="[bold blue]Vdev Topology[/bold blue]",
+            title=title,
             box=box.ROUNDED,
             padding=(0, 1)
         )
@@ -2120,10 +2180,16 @@ def create_expanded_pools_view(pool_data: Dict[str, Any], mode: str) -> Layout:
             title="[bold blue]Vdev Topology[/bold blue]",
             box=box.ROUNDED
         )
+        total_lines = 0
 
-    # Footer
+    # Footer with scroll controls if paginated
+    if total_lines > page_size:
+        footer_text = "[↑/↓] Scroll | [Esc] Back | [q] Quit"
+    else:
+        footer_text = "[Esc] Back | [q] Quit"
+
     footer = Panel(
-        Text("[Esc] Back | [q] Quit", justify="center", style="dim"),
+        Text(footer_text, justify="center", style="dim"),
         box=box.ROUNDED
     )
 
@@ -2906,7 +2972,8 @@ def create_view(
     elif current_view == 'pools':
         return create_expanded_pools_view(
             cached_data['pool'],
-            mode
+            mode,
+            scroll_offset=scroll_offset
         )
 
     # Default: main dashboard
@@ -3141,20 +3208,25 @@ def main():
                         scroll_offset = 0  # Reset scroll on view change
 
                     # Scroll up (arrow up or k for vim-style)
-                    elif current_view in ('nfs', 'datasets') and (key == 'UP' or key == 'k'):
+                    elif current_view in ('nfs', 'datasets', 'pools') and (key == 'UP' or key == 'k'):
                         scroll_offset = max(0, scroll_offset - 1)
 
                     # Scroll down (arrow down or j for vim-style)
-                    elif current_view in ('nfs', 'datasets') and (key == 'DOWN' or key == 'j'):
+                    elif current_view in ('nfs', 'datasets', 'pools') and (key == 'DOWN' or key == 'j'):
                         # Get total items to prevent scrolling past end
                         if current_view == 'nfs':
                             total = len(current_data.get('nfs', {}).get('connections', []))
+                            view_page_size = page_size  # 12
                         elif current_view == 'datasets':
                             total = len(current_data.get('dataset', {}).get('datasets', []))
+                            view_page_size = 20
+                        elif current_view == 'pools':
+                            # Count topology lines for pools
+                            total = _count_pool_topology_lines(current_data.get('pool', {}))
+                            view_page_size = 15
                         else:
                             total = 0
-                        # Use appropriate page size (datasets uses 20, nfs uses 12)
-                        view_page_size = 20 if current_view == 'datasets' else page_size
+                            view_page_size = page_size
                         max_offset = max(0, total - view_page_size)
                         scroll_offset = min(max_offset, scroll_offset + 1)
 
