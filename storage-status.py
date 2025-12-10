@@ -405,15 +405,26 @@ class StorageStatus:
 
     def get_dataset_usage(self) -> Dict[str, Any]:
         """
-        Get ZFS dataset usage information.
+        Get ZFS dataset usage information with detailed properties.
 
         Returns:
-            Dictionary with dataset information
+            Dictionary with dataset information including:
+            - name: Dataset name
+            - used: Space used by dataset and children
+            - avail: Available space
+            - refer: Referenced data (data accessible by this dataset)
+            - compress: Compression ratio
+            - mountpoint: Mount location
+            - quota: Space quota (none if unlimited)
+            - reservation: Reserved space (none if unreserved)
+            - recordsize: Block size
+            - snapshots: Number of snapshots for this dataset
         """
         datasets = []
 
+        # Get dataset properties including quota, reservation, recordsize
         success, output = self.runner.run(
-            "zfs list -H -o name,used,avail,refer,compressratio,mountpoint"
+            "zfs list -H -o name,used,avail,refer,compressratio,mountpoint,quota,reservation,recordsize"
         )
         if not success:
             return {'error': output, 'datasets': []}
@@ -422,7 +433,7 @@ class StorageStatus:
             if not line:
                 continue
             parts = line.split('\t')
-            if len(parts) >= 6:
+            if len(parts) >= 9:
                 datasets.append({
                     'name': parts[0],
                     'used': parts[1],
@@ -430,9 +441,38 @@ class StorageStatus:
                     'refer': parts[3],
                     'compress': parts[4],
                     'mountpoint': parts[5],
+                    'quota': parts[6] if parts[6] != 'none' else None,
+                    'reservation': parts[7] if parts[7] != 'none' else None,
+                    'recordsize': parts[8],
+                    'snapshots': 0,  # Will be populated below
                 })
 
+        # Get snapshot counts per dataset
+        snapshot_counts = self._get_snapshot_counts()
+        for dataset in datasets:
+            dataset['snapshots'] = snapshot_counts.get(dataset['name'], 0)
+
         return {'datasets': datasets}
+
+    def _get_snapshot_counts(self) -> Dict[str, int]:
+        """
+        Get count of snapshots for each dataset.
+
+        Returns:
+            Dictionary mapping dataset names to snapshot counts
+        """
+        counts = {}
+
+        # List all snapshots and count per dataset
+        success, output = self.runner.run("zfs list -H -t snapshot -o name 2>/dev/null")
+        if success and output.strip():
+            for line in output.strip().split('\n'):
+                if '@' in line:
+                    # Snapshot format: dataset@snapname
+                    dataset_name = line.split('@')[0]
+                    counts[dataset_name] = counts.get(dataset_name, 0) + 1
+
+        return counts
 
     def get_service_status(self) -> Dict[str, Any]:
         """
@@ -1631,6 +1671,142 @@ def _format_runtime(seconds: Optional[int]) -> str:
         return f"{days}d {hours}h"
 
 
+def create_expanded_datasets_view(
+    dataset_data: Dict[str, Any],
+    mode: str,
+    scroll_offset: int = 0,
+    page_size: int = 20
+) -> Layout:
+    """
+    Create a full-screen expanded view of ZFS datasets with a single
+    comprehensive table showing all dataset properties.
+
+    Args:
+        dataset_data: Dataset information from get_dataset_usage()
+        mode: 'local' or 'remote'
+        scroll_offset: Starting index for display (for pagination)
+        page_size: Number of datasets to display per page
+
+    Returns:
+        Rich Layout with expanded datasets view
+    """
+    layout = Layout()
+
+    # Header
+    mode_text = "Local" if mode == 'local' else f"Remote ({SSH_HOST})"
+    header = Panel(
+        Text(f"ZFS Datasets - {mode_text} - {datetime.now().strftime('%H:%M:%S')}",
+             justify="center", style="bold"),
+        box=box.ROUNDED
+    )
+
+    # Build dataset table
+    datasets = dataset_data.get('datasets', [])
+    total_datasets = len(datasets)
+
+    if not datasets:
+        content_panel = Panel(
+            Text("No ZFS datasets found", style="dim", justify="center"),
+            title="[bold blue]ZFS Datasets (0)[/bold blue]",
+            box=box.ROUNDED
+        )
+    else:
+        # Create comprehensive table
+        table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Dataset", style="cyan", no_wrap=True)
+        table.add_column("Used", justify="right", width=8)
+        table.add_column("Avail", justify="right", width=8)
+        table.add_column("Refer", justify="right", width=8)
+        table.add_column("Ratio", justify="right", width=6)
+        table.add_column("Quota", justify="right", width=8)
+        table.add_column("Reserv", justify="right", width=8)
+        table.add_column("Record", justify="right", width=7)
+        table.add_column("Snaps", justify="right", width=5)
+        table.add_column("Mountpoint", style="dim", no_wrap=True)
+
+        # Apply pagination
+        visible_datasets = datasets[scroll_offset:scroll_offset + page_size]
+
+        for idx, ds in enumerate(visible_datasets, scroll_offset + 1):
+            # Format dataset name with indentation for hierarchy
+            name = ds.get('name', '-')
+            depth = name.count('/')
+            if depth > 0:
+                # Show only the last component with indentation
+                short_name = '  ' * depth + name.split('/')[-1]
+            else:
+                short_name = name
+
+            # Format quota/reservation (show '-' if None)
+            quota = ds.get('quota') or '-'
+            reservation = ds.get('reservation') or '-'
+
+            # Format snapshot count with color if > 0
+            snap_count = ds.get('snapshots', 0)
+            if snap_count > 0:
+                snap_text = Text(str(snap_count), style="cyan")
+            else:
+                snap_text = Text("0", style="dim")
+
+            # Truncate mountpoint if too long
+            mountpoint = ds.get('mountpoint', '-')
+            if len(mountpoint) > 25:
+                mountpoint = '...' + mountpoint[-22:]
+
+            table.add_row(
+                str(idx),
+                short_name,
+                ds.get('used', '-'),
+                ds.get('avail', '-'),
+                ds.get('refer', '-'),
+                ds.get('compress', '-'),
+                quota,
+                reservation,
+                ds.get('recordsize', '-'),
+                snap_text,
+                mountpoint,
+            )
+
+        # Build title with scroll indicator if needed
+        if total_datasets > page_size:
+            end_idx = min(scroll_offset + page_size, total_datasets)
+            scroll_indicator = f" [{scroll_offset + 1}-{end_idx} of {total_datasets}]"
+            up_arrow = "↑" if scroll_offset > 0 else " "
+            down_arrow = "↓" if scroll_offset + page_size < total_datasets else " "
+            title = f"[bold blue]ZFS Datasets ({total_datasets}){scroll_indicator} {up_arrow}{down_arrow}[/bold blue]"
+        else:
+            title = f"[bold blue]ZFS Datasets ({total_datasets})[/bold blue]"
+
+        content_panel = Panel(
+            table,
+            title=title,
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Footer with scroll controls if paginated
+    if total_datasets > page_size:
+        footer_text = "[↑/↓] Scroll | [Esc] Back | [q] Quit"
+    else:
+        footer_text = "[Esc] Back | [q] Quit"
+
+    footer = Panel(
+        Text(footer_text, justify="center", style="dim"),
+        box=box.ROUNDED
+    )
+
+    # Arrange layout - single content section
+    layout.split_column(
+        Layout(header, name="header", size=3),
+        Layout(content_panel, name="body"),
+        Layout(footer, name="footer", size=3)
+    )
+
+    return layout
+
+
 def create_expanded_services_view(service_data: Dict[str, Any], mode: str) -> Layout:
     """
     Create a full-screen expanded view of services with two sections:
@@ -2249,7 +2425,13 @@ def create_view(
             cached_data['service'],
             mode
         )
-    # Future expanded views: pools, datasets
+    elif current_view == 'datasets':
+        return create_expanded_datasets_view(
+            cached_data['dataset'],
+            mode,
+            scroll_offset=scroll_offset
+        )
+    # Future expanded views: pools
 
     # Default: main dashboard
     return create_dashboard_from_cache(cached_data, mode, show_smb)
@@ -2463,7 +2645,10 @@ def main():
                 key = keyboard.get_key()
                 if key:
                     # Number keys for expanded views (only on dashboard)
-                    if current_view == 'dashboard' and key == '3':
+                    if current_view == 'dashboard' and key == '2':
+                        current_view = 'datasets'
+                        scroll_offset = 0  # Reset scroll on view change
+                    elif current_view == 'dashboard' and key == '3':
                         current_view = 'services'
                         scroll_offset = 0  # Reset scroll on view change
                     elif current_view == 'dashboard' and key == '4':
@@ -2475,17 +2660,24 @@ def main():
                     elif current_view == 'dashboard' and key == '6':
                         current_view = 'nfs'
                         scroll_offset = 0  # Reset scroll on view change
-                    # Future: add keys 1-2 for pools, datasets
+                    # Future: add key 1 for pools
 
                     # Scroll up (arrow up or k for vim-style)
-                    elif current_view == 'nfs' and (key == 'UP' or key == 'k'):
+                    elif current_view in ('nfs', 'datasets') and (key == 'UP' or key == 'k'):
                         scroll_offset = max(0, scroll_offset - 1)
 
                     # Scroll down (arrow down or j for vim-style)
-                    elif current_view == 'nfs' and (key == 'DOWN' or key == 'j'):
-                        # Get total connections to prevent scrolling past end
-                        total = len(current_data.get('nfs', {}).get('connections', []))
-                        max_offset = max(0, total - page_size)
+                    elif current_view in ('nfs', 'datasets') and (key == 'DOWN' or key == 'j'):
+                        # Get total items to prevent scrolling past end
+                        if current_view == 'nfs':
+                            total = len(current_data.get('nfs', {}).get('connections', []))
+                        elif current_view == 'datasets':
+                            total = len(current_data.get('dataset', {}).get('datasets', []))
+                        else:
+                            total = 0
+                        # Use appropriate page size (datasets uses 20, nfs uses 12)
+                        view_page_size = 20 if current_view == 'datasets' else page_size
+                        max_offset = max(0, total - view_page_size)
                         scroll_offset = min(max_offset, scroll_offset + 1)
 
                     # Escape or Backspace to return to dashboard

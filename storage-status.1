@@ -35,7 +35,7 @@ When running in live mode (without \fB\-\-once\fR):
 .B 1\-6
 Expand the corresponding panel to full screen.
 Panel numbers are shown in the panel titles.
-Currently implemented: \fB3\fR for Services details, \fB4\fR for Network details, \fB5\fR for SMB details, \fB6\fR for NFS details.
+Currently implemented: \fB2\fR for ZFS Datasets, \fB3\fR for Services details, \fB4\fR for Network details, \fB5\fR for SMB details, \fB6\fR for NFS details.
 .TP
 .B Esc / Backspace
 Return to the main dashboard from an expanded view.
@@ -87,6 +87,18 @@ Lists network interfaces with their state (UP/DOWN) and IP addresses.
 Toggleable panel showing either SMB connections (user and machine) or NFS connections
 (client IP addresses). Press \fBt\fR to toggle. The panel title shows counts for both.
 Multiple connections from the same client are deduplicated with a count suffix (e.g., "x2").
+.SS ZFS Datasets Expanded View
+Press \fB2\fR to view detailed ZFS dataset information in a comprehensive table:
+.RS
+.IP \(bu 2
+Dataset name (with hierarchical indentation), used space, available space, referenced data
+.IP \(bu 2
+Compression ratio, quota, reservation, record size
+.IP \(bu 2
+Snapshot count per dataset and mountpoint
+.RE
+.PP
+Supports scrolling with arrow keys or j/k for large dataset lists.
 .SS Services Expanded View
 Press \fB3\fR to view detailed service information in two sections:
 .RS

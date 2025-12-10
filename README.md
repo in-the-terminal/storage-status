@@ -65,7 +65,7 @@ In live mode (without `--once`):
 | Key | Action |
 |-----|--------|
 | `1` | Expand ZFS Pools (coming soon) |
-| `2` | Expand ZFS Datasets (coming soon) |
+| `2` | Expand ZFS Datasets (quota, reservation, snapshots) |
 | `3` | Expand Services (running/stopped, memory, restarts) |
 | `4` | Expand Network Interfaces (details + traffic stats) |
 | `5` | Expand SMB Details (connections + shares) |
