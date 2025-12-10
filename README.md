@@ -66,7 +66,7 @@ In live mode (without `--once`):
 |-----|--------|
 | `1` | Expand ZFS Pools (coming soon) |
 | `2` | Expand ZFS Datasets (coming soon) |
-| `3` | Expand Services (coming soon) |
+| `3` | Expand Services (running/stopped, memory, restarts) |
 | `4` | Expand Network Interfaces (details + traffic stats) |
 | `5` | Expand SMB Details (connections + shares) |
 | `6` | Expand NFS Details (connections + exports) |

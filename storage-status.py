@@ -436,28 +436,126 @@ class StorageStatus:
 
     def get_service_status(self) -> Dict[str, Any]:
         """
-        Get status of critical services.
+        Get status of critical services with detailed information.
 
         Returns:
-            Dictionary with service status information
+            Dictionary with service status information including:
+            - name: Service name
+            - state: active/inactive/failed/completed
+            - pid: Main process ID (for running services)
+            - memory: Memory usage in bytes
+            - runtime: How long service has been running
+            - restarts: Number of restarts (NRestarts)
+            - description: Human-readable service description
         """
-        services = ['smbd', 'nfs-server', 'zfs-import-cache', 'zfs-mount', 'ssh']
+        services = [
+            'smbd', 'nfs-server', 'zfs-import-cache', 'zfs-mount', 'ssh',
+            'docker', 'containerd', 'rsync', 'rpcbind', 'nfs-mountd',
+            'smartd', 'zed', 'cron'
+        ]
         status = {}
+        detailed_services = []
+
+        # Properties to fetch from systemctl show
+        props = 'ActiveState,SubState,MainPID,MemoryCurrent,NRestarts,Description,ActiveEnterTimestamp,Result'
 
         for service in services:
-            success, output = self.runner.run(f"systemctl is-active {service}")
-            # is-active returns non-zero for inactive/failed, but output still tells us the state
-            state = output.strip() if output.strip() else 'unknown'
-            # For one-shot services, check if they completed successfully
-            if state == 'inactive':
-                success2, output2 = self.runner.run(
-                    f"systemctl show -p ExecMainExitTimestamp,Result {service}"
-                )
-                if success2 and 'Result=success' in output2:
-                    state = 'completed'
-            status[service] = state
+            # Get detailed properties in one call
+            success, output = self.runner.run(f"systemctl show -p {props} {service} 2>/dev/null")
 
-        return {'services': status}
+            service_info = {
+                'name': service,
+                'state': 'unknown',
+                'pid': None,
+                'memory': None,
+                'runtime': None,
+                'restarts': 0,
+                'description': service,
+            }
+
+            if success and output.strip():
+                props_dict = {}
+                for line in output.strip().split('\n'):
+                    if '=' in line:
+                        key, val = line.split('=', 1)
+                        props_dict[key] = val
+
+                # Determine state
+                active_state = props_dict.get('ActiveState', 'unknown')
+                sub_state = props_dict.get('SubState', '')
+                result = props_dict.get('Result', '')
+
+                if active_state == 'active':
+                    service_info['state'] = 'active'
+                elif active_state == 'inactive':
+                    # Check if one-shot service completed successfully
+                    if result == 'success':
+                        service_info['state'] = 'completed'
+                    else:
+                        service_info['state'] = 'inactive'
+                elif active_state == 'failed':
+                    service_info['state'] = 'failed'
+                else:
+                    service_info['state'] = active_state
+
+                # PID (only meaningful for running services)
+                pid = props_dict.get('MainPID', '0')
+                if pid and pid != '0':
+                    service_info['pid'] = int(pid)
+
+                # Memory (may be unavailable or show as max uint64)
+                memory = props_dict.get('MemoryCurrent', '')
+                if memory and memory.isdigit():
+                    mem_val = int(memory)
+                    # Filter out "infinity" value (max uint64)
+                    if mem_val < 2**62:
+                        service_info['memory'] = mem_val
+
+                # Restarts
+                restarts = props_dict.get('NRestarts', '0')
+                if restarts.isdigit():
+                    service_info['restarts'] = int(restarts)
+
+                # Description
+                desc = props_dict.get('Description', service)
+                service_info['description'] = desc if desc else service
+
+                # Runtime (calculate from ActiveEnterTimestamp)
+                timestamp = props_dict.get('ActiveEnterTimestamp', '')
+                if timestamp and active_state == 'active':
+                    service_info['runtime'] = self._parse_systemd_timestamp(timestamp)
+
+            # Also store in simple dict for backward compatibility
+            status[service] = service_info['state']
+            detailed_services.append(service_info)
+
+        return {'services': status, 'detailed': detailed_services}
+
+    def _parse_systemd_timestamp(self, timestamp: str) -> Optional[int]:
+        """
+        Parse systemd timestamp and return seconds since activation.
+
+        Args:
+            timestamp: Systemd timestamp string (e.g., "Sun 2025-12-08 10:30:00 UTC")
+
+        Returns:
+            Seconds since activation, or None if parsing fails
+        """
+        if not timestamp or timestamp == 'n/a':
+            return None
+        try:
+            # Systemd format: "Weekday YYYY-MM-DD HH:MM:SS TZ"
+            # Strip weekday and timezone for parsing
+            parts = timestamp.split()
+            if len(parts) >= 3:
+                date_str = f"{parts[1]} {parts[2]}"
+                dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                now = datetime.now()
+                delta = now - dt
+                return int(delta.total_seconds())
+        except (ValueError, IndexError):
+            pass
+        return None
 
     def get_system_resources(self) -> Dict[str, Any]:
         """
@@ -1506,6 +1604,204 @@ def _format_traffic_bytes(bytes_val: Optional[int]) -> str:
     return f"{bytes_val:.1f} PB"
 
 
+def _format_runtime(seconds: Optional[int]) -> str:
+    """
+    Format runtime in seconds to human-readable format.
+
+    Args:
+        seconds: Runtime in seconds
+
+    Returns:
+        Formatted runtime string (e.g., '2d 5h', '3h 45m', '15m')
+    """
+    if seconds is None:
+        return '-'
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        minutes = seconds // 60
+        return f"{minutes}m"
+    elif seconds < 86400:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        return f"{hours}h {minutes}m"
+    else:
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        return f"{days}d {hours}h"
+
+
+def create_expanded_services_view(service_data: Dict[str, Any], mode: str) -> Layout:
+    """
+    Create a full-screen expanded view of services with two sections:
+    running/active services on top, stopped/failed services below.
+
+    Args:
+        service_data: Service information from get_service_status()
+        mode: 'local' or 'remote'
+
+    Returns:
+        Rich Layout with expanded services view
+    """
+    layout = Layout()
+
+    # Header
+    mode_text = "Local" if mode == 'local' else f"Remote ({SSH_HOST})"
+    header = Panel(
+        Text(f"Services - {mode_text} - {datetime.now().strftime('%H:%M:%S')}",
+             justify="center", style="bold"),
+        box=box.ROUNDED
+    )
+
+    # Get detailed service list
+    detailed = service_data.get('detailed', [])
+
+    # Split into running and stopped/failed
+    running_services = []
+    stopped_services = []
+
+    for svc in detailed:
+        state = svc.get('state', 'unknown')
+        if state in ('active', 'completed'):
+            running_services.append(svc)
+        else:
+            stopped_services.append(svc)
+
+    # Section 1: Running Services
+    if not running_services:
+        running_panel = Panel(
+            Text("No services running", style="dim", justify="center"),
+            title="[bold green]Running Services (0)[/bold green]",
+            box=box.ROUNDED
+        )
+    else:
+        running_table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        running_table.add_column("#", style="dim", width=3)
+        running_table.add_column("Service", style="cyan", no_wrap=True, width=18)
+        running_table.add_column("State", width=10)
+        running_table.add_column("PID", justify="right", width=7)
+        running_table.add_column("Memory", justify="right", width=10)
+        running_table.add_column("Runtime", justify="right", width=10)
+        running_table.add_column("Restarts", justify="right", width=8)
+        running_table.add_column("Description", style="dim", no_wrap=True)
+
+        for idx, svc in enumerate(running_services, 1):
+            state = svc.get('state', 'unknown')
+            if state == 'active':
+                state_text = Text("● active", style="green")
+            else:  # completed
+                state_text = Text("✓ done", style="green")
+
+            # Format memory
+            memory = svc.get('memory')
+            if memory is not None:
+                memory_str = _format_traffic_bytes(memory)
+            else:
+                memory_str = '-'
+
+            # Format restarts with color if > 0
+            restarts = svc.get('restarts', 0)
+            if restarts > 0:
+                restarts_text = Text(str(restarts), style="yellow")
+            else:
+                restarts_text = Text("0", style="dim")
+
+            # Truncate description if too long
+            desc = svc.get('description', '-')
+            if len(desc) > 40:
+                desc = desc[:37] + '...'
+
+            running_table.add_row(
+                str(idx),
+                svc.get('name', '-'),
+                state_text,
+                str(svc.get('pid', '-')) if svc.get('pid') else '-',
+                memory_str,
+                _format_runtime(svc.get('runtime')),
+                restarts_text,
+                desc,
+            )
+
+        running_panel = Panel(
+            running_table,
+            title=f"[bold green]Running Services ({len(running_services)})[/bold green]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Section 2: Stopped/Failed Services
+    if not stopped_services:
+        stopped_panel = Panel(
+            Text("All services running", style="dim", justify="center"),
+            title="[bold yellow]Stopped/Failed Services (0)[/bold yellow]",
+            box=box.ROUNDED
+        )
+    else:
+        stopped_table = Table(box=box.SIMPLE, show_header=True, header_style="bold", expand=True)
+        stopped_table.add_column("#", style="dim", width=3)
+        stopped_table.add_column("Service", style="cyan", no_wrap=True, width=18)
+        stopped_table.add_column("State", width=10)
+        stopped_table.add_column("Restarts", justify="right", width=8)
+        stopped_table.add_column("Description", style="dim", no_wrap=True)
+
+        for idx, svc in enumerate(stopped_services, 1):
+            state = svc.get('state', 'unknown')
+            if state == 'failed':
+                state_text = Text("✗ failed", style="red")
+            elif state == 'inactive':
+                state_text = Text("○ stopped", style="yellow")
+            else:
+                state_text = Text(state, style="dim")
+
+            # Format restarts with color if > 0
+            restarts = svc.get('restarts', 0)
+            if restarts > 0:
+                restarts_text = Text(str(restarts), style="yellow")
+            else:
+                restarts_text = Text("0", style="dim")
+
+            # Truncate description if too long
+            desc = svc.get('description', '-')
+            if len(desc) > 50:
+                desc = desc[:47] + '...'
+
+            stopped_table.add_row(
+                str(idx),
+                svc.get('name', '-'),
+                state_text,
+                restarts_text,
+                desc,
+            )
+
+        stopped_panel = Panel(
+            stopped_table,
+            title=f"[bold yellow]Stopped/Failed Services ({len(stopped_services)})[/bold yellow]",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+    # Footer
+    footer = Panel(
+        Text("[Esc] Back | [q] Quit", justify="center", style="dim"),
+        box=box.ROUNDED
+    )
+
+    # Arrange layout with two sections
+    layout.split_column(
+        Layout(header, name="header", size=3),
+        Layout(name="body"),
+        Layout(footer, name="footer", size=3)
+    )
+
+    # Split body into two sections (running on top, stopped below)
+    layout["body"].split_column(
+        Layout(running_panel, name="running"),
+        Layout(stopped_panel, name="stopped"),
+    )
+
+    return layout
+
+
 def create_expanded_network_view(network_data: Dict[str, Any], mode: str) -> Layout:
     """
     Create a full-screen expanded view of network interfaces with a single
@@ -1948,7 +2244,12 @@ def create_view(
             cached_data['network'],
             mode
         )
-    # Future expanded views: pools, datasets, services
+    elif current_view == 'services':
+        return create_expanded_services_view(
+            cached_data['service'],
+            mode
+        )
+    # Future expanded views: pools, datasets
 
     # Default: main dashboard
     return create_dashboard_from_cache(cached_data, mode, show_smb)
@@ -2162,7 +2463,10 @@ def main():
                 key = keyboard.get_key()
                 if key:
                     # Number keys for expanded views (only on dashboard)
-                    if current_view == 'dashboard' and key == '4':
+                    if current_view == 'dashboard' and key == '3':
+                        current_view = 'services'
+                        scroll_offset = 0  # Reset scroll on view change
+                    elif current_view == 'dashboard' and key == '4':
                         current_view = 'network'
                         scroll_offset = 0  # Reset scroll on view change
                     elif current_view == 'dashboard' and key == '5':
@@ -2171,7 +2475,7 @@ def main():
                     elif current_view == 'dashboard' and key == '6':
                         current_view = 'nfs'
                         scroll_offset = 0  # Reset scroll on view change
-                    # Future: add keys 1-3 for pools, datasets, services
+                    # Future: add keys 1-2 for pools, datasets
 
                     # Scroll up (arrow up or k for vim-style)
                     elif current_view == 'nfs' and (key == 'UP' or key == 'k'):
