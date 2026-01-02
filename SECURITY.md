@@ -55,7 +55,7 @@ This document summarizes the security vulnerabilities identified and fixed in st
 3. **Proper Quoting:** When shell execution is necessary (for static commands), all dynamic values are properly quoted using `shlex.quote()`
 4. **Timeout Protection:** Network operations (DNS lookups, subprocess calls) have appropriate timeouts
 5. **Error Handling:** All potentially dangerous operations are wrapped in try-except blocks
-6. **Character Set Restrictions:** Interface names are restricted to alphanumeric characters, dots, underscores, and hyphens (no colons)
+6. **Path Traversal Protection:** File paths are validated using `os.path.realpath()` to prevent directory traversal attacks
 
 ## Remaining shell=True Usage
 

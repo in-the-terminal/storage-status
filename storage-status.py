@@ -357,22 +357,21 @@ def parse_size(size_str: str) -> int:
         return 0
 
 
-def validate_name(name: str, allowed_chars: str = r'a-zA-Z0-9._-') -> Optional[str]:
+def validate_name(name: str, allowed_pattern: str = r'^[a-zA-Z0-9._-]+$') -> Optional[str]:
     """
     Validate a name (pool, interface, etc.) to prevent command injection.
     
     Args:
         name: The name to validate
-        allowed_chars: Character class content for regex (without brackets)
+        allowed_pattern: Complete regex pattern for validation
         
     Returns:
         The original name if valid, None if invalid
     """
     if not name:
         return None
-    # Construct safe regex pattern - allowed_chars should be a character class content
-    # without the surrounding brackets, e.g., 'a-zA-Z0-9._-'
-    pattern = re.compile(f'^[{re.escape(allowed_chars)}]+$')
+    # Use pre-defined pattern for safety
+    pattern = re.compile(allowed_pattern)
     if pattern.match(name):
         return name
     return None
@@ -610,7 +609,7 @@ class StorageStatus:
         scan = None
 
         # Validate pool name to prevent command injection
-        safe_pool_name = validate_name(pool_name, r'a-zA-Z0-9._-')
+        safe_pool_name = validate_name(pool_name)
         if not safe_pool_name:
             return topology, errors, scan
 
@@ -816,7 +815,7 @@ class StorageStatus:
 
         for service in services:
             # Validate service name as extra safety measure
-            safe_service = validate_name(service, r'a-zA-Z0-9._-')
+            safe_service = validate_name(service)
             if not safe_service:
                 continue
             # Get detailed properties in one call
@@ -1018,13 +1017,18 @@ class StorageStatus:
         for iface in interfaces:
             name = iface['name']
             # Validate interface name to prevent path traversal/command injection
-            safe_name = validate_name(name, r'a-zA-Z0-9._-')
+            safe_name = validate_name(name)
             if not safe_name:
                 continue
-            # Construct safe path and verify it's within expected directory
+            # Construct path and verify it's within expected directory (prevent traversal)
             speed_path = f'/sys/class/net/{safe_name}/speed'
-            # Additional safety: ensure path is in expected location
-            if not speed_path.startswith('/sys/class/net/'):
+            # Resolve to real path and verify it's in the expected location
+            try:
+                import os.path
+                real_path = os.path.realpath(speed_path)
+                if not real_path.startswith('/sys/class/net/'):
+                    continue
+            except (OSError, ValueError):
                 continue
             # Use run_safe for consistent security approach
             success, speed = self.runner.run_safe(['cat', speed_path])
