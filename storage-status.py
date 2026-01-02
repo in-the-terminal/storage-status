@@ -27,6 +27,7 @@ import termios
 import tty
 import threading
 import tempfile
+import shlex
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 
@@ -243,7 +244,7 @@ class CommandRunner:
         SSH commands use ControlMaster for connection multiplexing.
 
         Args:
-            command: The command to execute
+            command: The command to execute (string for shell execution)
             timeout: Timeout in seconds
 
         Returns:
@@ -251,6 +252,8 @@ class CommandRunner:
         """
         try:
             if self.is_local:
+                # For local execution, use shell=True with the command string
+                # This is necessary for commands with pipes, redirects, etc.
                 result = subprocess.run(
                     command,
                     shell=True,
@@ -271,6 +274,48 @@ class CommandRunner:
             else:
                 # Return stdout if available (some commands output there even on failure)
                 # otherwise return stderr
+                return False, result.stdout if result.stdout else result.stderr
+
+        except subprocess.TimeoutExpired:
+            return False, "Command timed out"
+        except Exception as e:
+            return False, str(e)
+
+    def run_safe(self, args: List[str], timeout: int = 30) -> Tuple[bool, str]:
+        """
+        Run a command safely without shell expansion either locally or via SSH.
+        This method should be used when incorporating untrusted or external data.
+
+        Args:
+            args: List of command arguments (e.g., ['zpool', 'status', pool_name])
+            timeout: Timeout in seconds
+
+        Returns:
+            Tuple of (success, output)
+        """
+        try:
+            if self.is_local:
+                # Use argument list directly for safe execution
+                result = subprocess.run(
+                    args,
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+            else:
+                # For SSH, quote each argument and build safe command
+                quoted_args = ' '.join(shlex.quote(arg) for arg in args)
+                result = subprocess.run(
+                    self._get_ssh_command(quoted_args),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+
+            if result.returncode == 0:
+                return True, result.stdout
+            else:
                 return False, result.stdout if result.stdout else result.stderr
 
         except subprocess.TimeoutExpired:
@@ -310,6 +355,26 @@ def parse_size(size_str: str) -> int:
         return int(size_str)
     except ValueError:
         return 0
+
+
+def validate_name(name: str, allowed_pattern: str = r'^[a-zA-Z0-9._-]+$') -> Optional[str]:
+    """
+    Validate a name (pool, interface, etc.) to prevent command injection.
+    
+    Args:
+        name: The name to validate
+        allowed_pattern: Complete regex pattern for validation
+        
+    Returns:
+        The original name if valid, None if invalid
+    """
+    if not name:
+        return None
+    # Use pre-defined pattern for safety
+    pattern = re.compile(allowed_pattern)
+    if pattern.match(name):
+        return name
+    return None
 
 
 def format_size(bytes_val: int) -> str:
@@ -543,7 +608,12 @@ class StorageStatus:
         errors = {'read': 0, 'write': 0, 'cksum': 0}
         scan = None
 
-        success, output = self.runner.run(f"zpool status {pool_name}")
+        # Validate pool name to prevent command injection
+        safe_pool_name = validate_name(pool_name)
+        if not safe_pool_name:
+            return topology, errors, scan
+
+        success, output = self.runner.run_safe(['zpool', 'status', safe_pool_name])
         if not success:
             return topology, errors, scan
 
@@ -744,8 +814,12 @@ class StorageStatus:
         props = 'ActiveState,SubState,MainPID,MemoryCurrent,NRestarts,Description,ActiveEnterTimestamp,Result'
 
         for service in services:
+            # Validate service name as extra safety measure
+            safe_service = validate_name(service)
+            if not safe_service:
+                continue
             # Get detailed properties in one call
-            success, output = self.runner.run(f"systemctl show -p {props} {service} 2>/dev/null")
+            success, output = self.runner.run_safe(['systemctl', 'show', '-p', props, safe_service])
 
             service_info = {
                 'name': service,
@@ -942,9 +1016,35 @@ class StorageStatus:
         # Get speed for each interface from sysfs
         for iface in interfaces:
             name = iface['name']
-            success, speed = self.runner.run(f"cat /sys/class/net/{name}/speed 2>/dev/null")
-            if success and speed.strip().isdigit():
-                iface['speed'] = int(speed.strip())
+            # Validate interface name to prevent path traversal/command injection
+            safe_name = validate_name(name)
+            if not safe_name:
+                continue
+            # Construct path and verify it's within expected directory (prevent traversal)
+            speed_path = f'/sys/class/net/{safe_name}/speed'
+            # Resolve to real path and verify it's in the expected location
+            # Normalize both paths to prevent symlink bypass
+            try:
+                expected_prefix = os.path.realpath('/sys/class/net')
+                real_path = os.path.realpath(speed_path)
+                if not real_path.startswith(expected_prefix + os.sep):
+                    continue
+            except (OSError, ValueError):
+                continue
+            # Use run_safe for consistent security approach
+            success, speed = self.runner.run_safe(['cat', speed_path])
+            if success:
+                speed_val = speed.strip()
+                # Parse speed value - can be negative (e.g., -1 for unknown speed)
+                # or positive integer. This is a change from original .isdigit() 
+                # behavior to properly handle negative values reported by some interfaces.
+                try:
+                    speed_int = int(speed_val)
+                    # Only set if it's a reasonable value (filter out -1, etc.)
+                    if speed_int >= 0:
+                        iface['speed'] = speed_int
+                except ValueError:
+                    pass  # Invalid speed value, skip it
 
         return {'interfaces': interfaces}
 
@@ -1106,12 +1206,18 @@ class StorageStatus:
                 machines_to_resolve.add(machine)
 
         hostname_cache: Dict[str, Optional[str]] = {}
-        for machine in machines_to_resolve:
-            try:
-                hostname, _, _ = socket.gethostbyaddr(machine)
-                hostname_cache[machine] = hostname
-            except (socket.herror, socket.gaierror, socket.timeout):
-                hostname_cache[machine] = None
+        # Set socket timeout for DNS lookups to prevent hanging
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(2.0)
+        try:
+            for machine in machines_to_resolve:
+                try:
+                    hostname, _, _ = socket.gethostbyaddr(machine)
+                    hostname_cache[machine] = hostname
+                except (socket.herror, socket.gaierror, socket.timeout):
+                    hostname_cache[machine] = None
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
         # Apply resolved hostnames
         for conn in connections:
@@ -1285,14 +1391,20 @@ class StorageStatus:
         unique_ips = set(conn['ip'] for conn in connections if conn.get('ip'))
         hostname_cache: Dict[str, Optional[str]] = {}
 
-        for ip in unique_ips:
-            try:
-                # Reverse DNS lookup with timeout (socket default)
-                hostname, _, _ = socket.gethostbyaddr(ip)
-                hostname_cache[ip] = hostname
-            except (socket.herror, socket.gaierror, socket.timeout):
-                # No reverse DNS entry or lookup failed
-                hostname_cache[ip] = None
+        # Set socket timeout for DNS lookups to prevent hanging
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(2.0)
+        try:
+            for ip in unique_ips:
+                try:
+                    # Reverse DNS lookup with timeout
+                    hostname, _, _ = socket.gethostbyaddr(ip)
+                    hostname_cache[ip] = hostname
+                except (socket.herror, socket.gaierror, socket.timeout):
+                    # No reverse DNS entry or lookup failed
+                    hostname_cache[ip] = None
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
         # Apply resolved hostnames to connections
         for conn in connections:
