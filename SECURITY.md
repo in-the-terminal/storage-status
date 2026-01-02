@@ -7,26 +7,26 @@ This document summarizes the security vulnerabilities identified and fixed in st
 
 ### 1. Command Injection via shell=True (CRITICAL)
 
-**Issue:** The code was using `subprocess.run()` with `shell=True` and incorporating external data into command strings without proper sanitization. This could allow command injection attacks if an attacker could manipulate system state (e.g., create malicious ZFS pool names or network interface names).
+**Issue:** The code was using `subprocess.run()` with `shell=True` and incorporating external data into command strings without proper validation. This could allow command injection attacks if an attacker could manipulate system state (e.g., create malicious ZFS pool names or network interface names).
 
-**Locations:**
-- Line 256: Using `shell=True` in `CommandRunner.run()`
-- Line 546: `f"zpool status {pool_name}"` - pool_name from zpool list output
-- Line 748: `f"systemctl show -p {props} {service}"` - service name from list
-- Line 945: `f"cat /sys/class/net/{name}/speed"` - interface name from ip command output
+**Vulnerable Code Patterns:**
+- Using `shell=True` with dynamic command strings
+- `f"zpool status {pool_name}"` - pool_name from zpool list output
+- `f"systemctl show -p {props} {service}"` - service name from list
+- `f"cat /sys/class/net/{name}/speed"` - interface name from ip command output
 
 **Risk:** An attacker who can manipulate pool names, interface names, or other system identifiers could potentially execute arbitrary commands on the system.
 
 **Fixes Applied:**
-1. Added `shlex` import for safe command quoting
+1. Added `shlex` import for safe command quoting (used in run() method for static commands)
 2. Created new `run_safe()` method in `CommandRunner` class that:
    - Uses `shell=False` for local execution
    - Accepts command arguments as a list instead of a string
    - Properly quotes arguments when executing via SSH
-3. Created `sanitize_name()` helper function to validate names against allowed character sets
+3. Created `validate_name()` helper function to validate names against allowed character sets
 4. Updated vulnerable code paths:
    - `_parse_pool_status()`: Now uses `run_safe(['zpool', 'status', safe_pool_name])`
-   - Network interface speed reading: Sanitizes and quotes interface names
+   - Network interface speed reading: Uses `run_safe(['cat', path])` with validated names
    - Service status queries: Uses `run_safe()` with argument lists
 
 **Result:** All dynamic data is now either validated or properly escaped before being used in commands.
@@ -50,11 +50,12 @@ This document summarizes the security vulnerabilities identified and fixed in st
 
 ## Security Best Practices Implemented
 
-1. **Input Validation:** All external data (pool names, interface names, service names) is validated against expected patterns before use
-2. **Safe Command Execution:** Commands with dynamic data use argument lists (`shell=False`) instead of string interpolation
-3. **Proper Quoting:** When shell execution is necessary, all dynamic values are properly quoted using `shlex.quote()`
+1. **Input Validation:** All external data (pool names, interface names, service names) is validated against expected patterns before use using `validate_name()`
+2. **Safe Command Execution:** Commands with dynamic data use argument lists (`shell=False`) instead of string interpolation via `run_safe()`
+3. **Proper Quoting:** When shell execution is necessary (for static commands), all dynamic values are properly quoted using `shlex.quote()`
 4. **Timeout Protection:** Network operations (DNS lookups, subprocess calls) have appropriate timeouts
 5. **Error Handling:** All potentially dangerous operations are wrapped in try-except blocks
+6. **Character Set Restrictions:** Interface names are restricted to alphanumeric characters, dots, underscores, and hyphens (no colons)
 
 ## Remaining shell=True Usage
 

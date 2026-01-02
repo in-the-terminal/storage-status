@@ -357,20 +357,20 @@ def parse_size(size_str: str) -> int:
         return 0
 
 
-def sanitize_name(name: str, allowed_chars: str = r'[a-zA-Z0-9._-]') -> Optional[str]:
+def validate_name(name: str, allowed_chars: str = r'[a-zA-Z0-9._-]') -> Optional[str]:
     """
-    Sanitize a name (pool, interface, etc.) to prevent command injection.
+    Validate a name (pool, interface, etc.) to prevent command injection.
     
     Args:
-        name: The name to sanitize
+        name: The name to validate
         allowed_chars: Regex character class of allowed characters
         
     Returns:
-        Sanitized name if valid, None if invalid
+        The original name if valid, None if invalid
     """
     if not name:
         return None
-    # Remove any characters not in the allowed set
+    # Check if name contains only allowed characters
     pattern = re.compile(f'^{allowed_chars}+$')
     if pattern.match(name):
         return name
@@ -608,8 +608,8 @@ class StorageStatus:
         errors = {'read': 0, 'write': 0, 'cksum': 0}
         scan = None
 
-        # Sanitize pool name to prevent command injection
-        safe_pool_name = sanitize_name(pool_name)
+        # Validate pool name to prevent command injection
+        safe_pool_name = validate_name(pool_name)
         if not safe_pool_name:
             return topology, errors, scan
 
@@ -814,8 +814,8 @@ class StorageStatus:
         props = 'ActiveState,SubState,MainPID,MemoryCurrent,NRestarts,Description,ActiveEnterTimestamp,Result'
 
         for service in services:
-            # Sanitize service name as extra safety measure
-            safe_service = sanitize_name(service, r'[a-zA-Z0-9._-]')
+            # Validate service name as extra safety measure
+            safe_service = validate_name(service, r'[a-zA-Z0-9._-]')
             if not safe_service:
                 continue
             # Get detailed properties in one call
@@ -1016,12 +1016,14 @@ class StorageStatus:
         # Get speed for each interface from sysfs
         for iface in interfaces:
             name = iface['name']
-            # Sanitize interface name to prevent path traversal/command injection
-            safe_name = sanitize_name(name, r'[a-zA-Z0-9._:-]')
+            # Validate interface name to prevent path traversal/command injection
+            # Note: colons removed from allowed chars as they're not typical in interface names
+            safe_name = validate_name(name, r'[a-zA-Z0-9._-]')
             if not safe_name:
                 continue
-            success, speed = self.runner.run(f"cat /sys/class/net/{shlex.quote(safe_name)}/speed 2>/dev/null")
-            if success and speed.strip().isdigit():
+            # Use run_safe for consistent security approach
+            success, speed = self.runner.run_safe(['cat', f'/sys/class/net/{safe_name}/speed'])
+            if success and speed.strip().lstrip('-').isdigit():
                 iface['speed'] = int(speed.strip())
 
         return {'interfaces': interfaces}
