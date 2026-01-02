@@ -1023,10 +1023,11 @@ class StorageStatus:
             # Construct path and verify it's within expected directory (prevent traversal)
             speed_path = f'/sys/class/net/{safe_name}/speed'
             # Resolve to real path and verify it's in the expected location
+            # Normalize both paths to prevent symlink bypass
             try:
-                import os.path
+                expected_prefix = os.path.realpath('/sys/class/net')
                 real_path = os.path.realpath(speed_path)
-                if not real_path.startswith('/sys/class/net/'):
+                if not real_path.startswith(expected_prefix + os.sep):
                     continue
             except (OSError, ValueError):
                 continue
@@ -1034,10 +1035,14 @@ class StorageStatus:
             success, speed = self.runner.run_safe(['cat', speed_path])
             if success:
                 speed_val = speed.strip()
-                # Handle negative values (some interfaces report -1 for unknown)
-                # Accept only valid integers (positive or negative)
+                # Parse speed value - can be negative (e.g., -1 for unknown speed)
+                # or positive integer. This is a change from original .isdigit() 
+                # behavior to properly handle negative values reported by some interfaces.
                 try:
-                    iface['speed'] = int(speed_val)
+                    speed_int = int(speed_val)
+                    # Only set if it's a reasonable value (filter out -1, etc.)
+                    if speed_int >= 0:
+                        iface['speed'] = speed_int
                 except ValueError:
                     pass  # Invalid speed value, skip it
 
