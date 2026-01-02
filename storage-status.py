@@ -357,21 +357,22 @@ def parse_size(size_str: str) -> int:
         return 0
 
 
-def validate_name(name: str, allowed_chars: str = r'[a-zA-Z0-9._-]') -> Optional[str]:
+def validate_name(name: str, allowed_chars: str = r'a-zA-Z0-9._-') -> Optional[str]:
     """
     Validate a name (pool, interface, etc.) to prevent command injection.
     
     Args:
         name: The name to validate
-        allowed_chars: Regex character class of allowed characters
+        allowed_chars: Character class content for regex (without brackets)
         
     Returns:
         The original name if valid, None if invalid
     """
     if not name:
         return None
-    # Check if name contains only allowed characters
-    pattern = re.compile(f'^{allowed_chars}+$')
+    # Construct safe regex pattern - allowed_chars should be a character class content
+    # without the surrounding brackets, e.g., 'a-zA-Z0-9._-'
+    pattern = re.compile(f'^[{re.escape(allowed_chars)}]+$')
     if pattern.match(name):
         return name
     return None
@@ -609,7 +610,7 @@ class StorageStatus:
         scan = None
 
         # Validate pool name to prevent command injection
-        safe_pool_name = validate_name(pool_name)
+        safe_pool_name = validate_name(pool_name, r'a-zA-Z0-9._-')
         if not safe_pool_name:
             return topology, errors, scan
 
@@ -815,7 +816,7 @@ class StorageStatus:
 
         for service in services:
             # Validate service name as extra safety measure
-            safe_service = validate_name(service, r'[a-zA-Z0-9._-]')
+            safe_service = validate_name(service, r'a-zA-Z0-9._-')
             if not safe_service:
                 continue
             # Get detailed properties in one call
@@ -1017,14 +1018,24 @@ class StorageStatus:
         for iface in interfaces:
             name = iface['name']
             # Validate interface name to prevent path traversal/command injection
-            # Note: colons removed from allowed chars as they're not typical in interface names
-            safe_name = validate_name(name, r'[a-zA-Z0-9._-]')
+            safe_name = validate_name(name, r'a-zA-Z0-9._-')
             if not safe_name:
                 continue
+            # Construct safe path and verify it's within expected directory
+            speed_path = f'/sys/class/net/{safe_name}/speed'
+            # Additional safety: ensure path is in expected location
+            if not speed_path.startswith('/sys/class/net/'):
+                continue
             # Use run_safe for consistent security approach
-            success, speed = self.runner.run_safe(['cat', f'/sys/class/net/{safe_name}/speed'])
-            if success and speed.strip().lstrip('-').isdigit():
-                iface['speed'] = int(speed.strip())
+            success, speed = self.runner.run_safe(['cat', speed_path])
+            if success:
+                speed_val = speed.strip()
+                # Handle negative values (some interfaces report -1 for unknown)
+                # Accept only valid integers (positive or negative)
+                try:
+                    iface['speed'] = int(speed_val)
+                except ValueError:
+                    pass  # Invalid speed value, skip it
 
         return {'interfaces': interfaces}
 
