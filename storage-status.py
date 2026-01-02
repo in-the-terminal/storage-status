@@ -1184,12 +1184,18 @@ class StorageStatus:
                 machines_to_resolve.add(machine)
 
         hostname_cache: Dict[str, Optional[str]] = {}
-        for machine in machines_to_resolve:
-            try:
-                hostname, _, _ = socket.gethostbyaddr(machine)
-                hostname_cache[machine] = hostname
-            except (socket.herror, socket.gaierror, socket.timeout):
-                hostname_cache[machine] = None
+        # Set socket timeout for DNS lookups to prevent hanging
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(2.0)
+        try:
+            for machine in machines_to_resolve:
+                try:
+                    hostname, _, _ = socket.gethostbyaddr(machine)
+                    hostname_cache[machine] = hostname
+                except (socket.herror, socket.gaierror, socket.timeout):
+                    hostname_cache[machine] = None
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
         # Apply resolved hostnames
         for conn in connections:
@@ -1363,14 +1369,20 @@ class StorageStatus:
         unique_ips = set(conn['ip'] for conn in connections if conn.get('ip'))
         hostname_cache: Dict[str, Optional[str]] = {}
 
-        for ip in unique_ips:
-            try:
-                # Reverse DNS lookup with timeout (socket default)
-                hostname, _, _ = socket.gethostbyaddr(ip)
-                hostname_cache[ip] = hostname
-            except (socket.herror, socket.gaierror, socket.timeout):
-                # No reverse DNS entry or lookup failed
-                hostname_cache[ip] = None
+        # Set socket timeout for DNS lookups to prevent hanging
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(2.0)
+        try:
+            for ip in unique_ips:
+                try:
+                    # Reverse DNS lookup with timeout
+                    hostname, _, _ = socket.gethostbyaddr(ip)
+                    hostname_cache[ip] = hostname
+                except (socket.herror, socket.gaierror, socket.timeout):
+                    # No reverse DNS entry or lookup failed
+                    hostname_cache[ip] = None
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
         # Apply resolved hostnames to connections
         for conn in connections:
