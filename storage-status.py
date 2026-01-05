@@ -529,7 +529,7 @@ class StorageStatus:
             bytes_val /= 1024.0
         return f"{bytes_val:.1f}E"
 
-    def _parse_pool_status(self, pool_name: str) -> Tuple[List[Dict], Dict[str, int], Optional[str]]:
+    def _parse_pool_status(self, pool_name: str) -> Tuple[List[Dict], Dict[str, int], Optional[Dict]]:
         """
         Parse zpool status output for topology, errors, and scan status.
 
@@ -537,7 +537,17 @@ class StorageStatus:
             pool_name: Name of the pool to query
 
         Returns:
-            Tuple of (topology list, error counts dict, scan status string)
+            Tuple of (topology list, error counts dict, scan status dict or None)
+            Scan status dict contains:
+                - type: 'resilver' | 'scrub' | 'none'
+                - status: 'in_progress' | 'completed' | 'canceled'
+                - percent: percentage complete (float or None)
+                - scanned: data scanned (e.g., "35.9T / 117T")
+                - issued: data issued with rate (e.g., "14.0T / 95.5T at 533M/s")
+                - resilvered: data resilvered (e.g., "4.79T")
+                - time_remaining: ETA (e.g., "1 days 20:35:30")
+                - start_time: when scan started (e.g., "Fri Jan 2 17:56:46 2026")
+                - summary: short summary string for table display
         """
         topology = []
         errors = {'read': 0, 'write': 0, 'cksum': 0}
@@ -550,45 +560,45 @@ class StorageStatus:
         lines = output.strip().split('\n')
         in_config = False
         current_vdev = None
+        current_vdev_class = 'data'  # Track vdev class: data, logs, cache, spares
 
-        for line in lines:
-            # Parse scan status
+        # Use index-based iteration to look ahead for multi-line scan info
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Parse scan status (may span multiple lines)
             if line.strip().startswith('scan:'):
-                scan_text = line.split(':', 1)[1].strip()
-                # Simplify scan status
-                if 'scrub in progress' in scan_text:
-                    # Extract progress percentage if available
-                    match = re.search(r'(\d+\.?\d*)%', scan_text)
-                    if match:
-                        scan = f"scrub {match.group(1)}%"
-                    else:
-                        scan = "scrub in progress"
-                elif 'resilver in progress' in scan_text:
-                    match = re.search(r'(\d+\.?\d*)%', scan_text)
-                    if match:
-                        scan = f"resilver {match.group(1)}%"
-                    else:
-                        scan = "resilver in progress"
-                elif 'scrub repaired' in scan_text or 'scrub canceled' in scan_text:
-                    scan = "scrub completed"
-                elif 'resilvered' in scan_text:
-                    scan = "resilver completed"
+                scan = self._parse_scan_status(lines, i)
+                i += 1
                 continue
 
             # Detect config section
             if line.strip() == 'config:':
                 in_config = True
+                i += 1
                 continue
 
             if not in_config:
+                i += 1
                 continue
 
             # Skip header line
             if 'NAME' in line and 'STATE' in line:
+                i += 1
                 continue
 
             # Skip empty lines and errors section
             if not line.strip() or line.strip().startswith('errors:'):
+                i += 1
+                continue
+
+            # Check for special vdev class headers (logs, cache, spares)
+            stripped = line.strip()
+            if stripped in ('logs', 'cache', 'spares'):
+                current_vdev_class = stripped
+                current_vdev = None  # Reset current vdev when entering new class
+                i += 1
                 continue
 
             # Parse device/vdev lines
@@ -610,10 +620,12 @@ class StorageStatus:
                 errors['cksum'] += cksum_err
 
                 # Determine indent level (vdev vs device)
+                # Tab counts as 1 char in Python's len()
+                # Pool name = indent 1, vdevs = indent 3, devices = indent 5
                 indent = len(line) - len(line.lstrip())
 
-                # Pool name is at indent 1, vdevs at 2, devices at 3+
-                if indent <= 8:  # vdev level (mirror, raidz, etc.)
+                # Pool name is at indent 1, vdevs at 3, devices at 5
+                if indent <= 3:  # vdev level (mirror, raidz, etc.) or pool name
                     if name != pool_name:  # Skip pool name itself
                         current_vdev = {
                             'name': name,
@@ -622,6 +634,7 @@ class StorageStatus:
                             'read_errors': read_err,
                             'write_errors': write_err,
                             'cksum_errors': cksum_err,
+                            'vdev_class': current_vdev_class,  # data, logs, cache, or spares
                         }
                         topology.append(current_vdev)
                 else:  # device level
@@ -643,9 +656,130 @@ class StorageStatus:
                             'read_errors': read_err,
                             'write_errors': write_err,
                             'cksum_errors': cksum_err,
+                            'vdev_class': current_vdev_class,
                         })
 
+            i += 1
+
         return topology, errors, scan
+
+    def _parse_scan_status(self, lines: List[str], start_idx: int) -> Optional[Dict]:
+        """
+        Parse multi-line scan status (resilver/scrub) from zpool status output.
+
+        Args:
+            lines: All lines from zpool status output
+            start_idx: Index of the line starting with 'scan:'
+
+        Returns:
+            Dictionary with detailed scan information or None if no scan
+        """
+        if start_idx >= len(lines):
+            return None
+
+        first_line = lines[start_idx].strip()
+        if not first_line.startswith('scan:'):
+            return None
+
+        scan_text = first_line.split(':', 1)[1].strip()
+
+        # Check for no scan or completed scan
+        if 'none requested' in scan_text:
+            return None
+
+        # Initialize scan info
+        scan_info = {
+            'type': None,
+            'status': None,
+            'percent': None,
+            'scanned': None,
+            'issued': None,
+            'resilvered': None,
+            'repaired': None,
+            'time_remaining': None,
+            'start_time': None,
+            'summary': None,
+        }
+
+        # Determine scan type and status from first line
+        if 'resilver in progress' in scan_text:
+            scan_info['type'] = 'resilver'
+            scan_info['status'] = 'in_progress'
+            # Extract start time: "since Fri Jan  2 17:56:46 2026"
+            match = re.search(r'since\s+(.+)$', scan_text)
+            if match:
+                scan_info['start_time'] = match.group(1).strip()
+        elif 'scrub in progress' in scan_text:
+            scan_info['type'] = 'scrub'
+            scan_info['status'] = 'in_progress'
+            match = re.search(r'since\s+(.+)$', scan_text)
+            if match:
+                scan_info['start_time'] = match.group(1).strip()
+        elif 'scrub repaired' in scan_text or 'scrub canceled' in scan_text:
+            scan_info['type'] = 'scrub'
+            scan_info['status'] = 'completed' if 'repaired' in scan_text else 'canceled'
+            scan_info['summary'] = 'scrub completed'
+            return scan_info
+        elif 'resilvered' in scan_text and 'in progress' not in scan_text:
+            scan_info['type'] = 'resilver'
+            scan_info['status'] = 'completed'
+            scan_info['summary'] = 'resilver completed'
+            return scan_info
+
+        # For in-progress scans, parse the next 1-2 lines for detailed progress
+        # Line 2 example: "35.9T / 117T scanned, 14.0T / 95.5T issued at 533M/s"
+        # Line 3 example: "4.79T resilvered, 14.61% done, 1 days 20:35:30 to go"
+        for offset in range(1, 4):
+            if start_idx + offset >= len(lines):
+                break
+            next_line = lines[start_idx + offset].strip()
+            # Stop if we hit another section
+            if next_line.startswith(('config:', 'errors:', 'action:', 'status:', 'see:')):
+                break
+            if not next_line or next_line.startswith(('pool:', 'state:')):
+                break
+
+            # Parse scanned data: "35.9T / 117T scanned"
+            scanned_match = re.search(r'([\d.]+[KMGTP]?)\s*/\s*([\d.]+[KMGTP]?)\s*scanned', next_line)
+            if scanned_match:
+                scan_info['scanned'] = f"{scanned_match.group(1)} / {scanned_match.group(2)}"
+
+            # Parse issued data: "14.0T / 95.5T issued at 533M/s"
+            issued_match = re.search(r'([\d.]+[KMGTP]?)\s*/\s*([\d.]+[KMGTP]?)\s*issued\s+at\s+([\d.]+[KMGTP]?/s)', next_line)
+            if issued_match:
+                scan_info['issued'] = f"{issued_match.group(1)} / {issued_match.group(2)} at {issued_match.group(3)}"
+
+            # Parse resilvered data: "4.79T resilvered"
+            resilvered_match = re.search(r'([\d.]+[KMGTP]?)\s*resilvered', next_line)
+            if resilvered_match:
+                scan_info['resilvered'] = resilvered_match.group(1)
+
+            # Parse repaired data for scrubs: "0B repaired"
+            repaired_match = re.search(r'([\d.]+[KMGTP]?)\s*repaired', next_line)
+            if repaired_match:
+                scan_info['repaired'] = repaired_match.group(1)
+
+            # Parse percentage: "14.61% done"
+            percent_match = re.search(r'([\d.]+)%\s*done', next_line)
+            if percent_match:
+                scan_info['percent'] = float(percent_match.group(1))
+
+            # Parse time remaining: "1 days 20:35:30 to go" or "20:35:30 to go"
+            time_match = re.search(r'((?:\d+\s*days?\s*)?[\d:]+)\s*to\s*go', next_line)
+            if time_match:
+                scan_info['time_remaining'] = time_match.group(1).strip()
+
+        # Create summary string for table display
+        if scan_info['status'] == 'in_progress':
+            if scan_info['percent'] is not None:
+                summary_parts = [f"{scan_info['type']} {scan_info['percent']:.1f}%"]
+                if scan_info['time_remaining']:
+                    summary_parts.append(f"ETA: {scan_info['time_remaining']}")
+                scan_info['summary'] = ' | '.join(summary_parts)
+            else:
+                scan_info['summary'] = f"{scan_info['type']} in progress"
+
+        return scan_info
 
     def get_dataset_usage(self) -> Dict[str, Any]:
         """
@@ -850,14 +984,31 @@ class StorageStatus:
         """
         resources = {}
 
+        # CPU core count
+        cpu_count = 1  # Default fallback
+        success, output = self.runner.run("nproc")
+        if success:
+            try:
+                cpu_count = int(output.strip())
+            except ValueError:
+                pass
+
         # Load average
         success, output = self.runner.run("cat /proc/loadavg")
         if success:
             parts = output.strip().split()
+            load_1 = float(parts[0])
+            load_5 = float(parts[1])
+            load_15 = float(parts[2])
             resources['load'] = {
-                '1min': float(parts[0]),
-                '5min': float(parts[1]),
-                '15min': float(parts[2]),
+                '1min': load_1,
+                '5min': load_5,
+                '15min': load_15,
+                'cpu_count': cpu_count,
+                # Percentage of total CPU capacity (load / cores * 100)
+                '1min_pct': (load_1 / cpu_count) * 100,
+                '5min_pct': (load_5 / cpu_count) * 100,
+                '15min_pct': (load_15 / cpu_count) * 100,
             }
 
         # Memory info
@@ -1496,10 +1647,14 @@ def create_resources_panel(resource_data: Dict[str, Any]) -> Panel:
     content.add_column(justify="right", style="bold")
     content.add_column(justify="left")
 
-    # Load average
+    # Load average (as percentage of total CPU capacity)
     if 'load' in resource_data:
         load = resource_data['load']
-        content.add_row("Load", f"{load['1min']:.2f} / {load['5min']:.2f} / {load['15min']:.2f}")
+        cpu_count = load.get('cpu_count', 1)
+        content.add_row(
+            f"Load ({cpu_count} cores)",
+            f"{load['1min_pct']:.0f}% / {load['5min_pct']:.0f}% / {load['15min_pct']:.0f}%"
+        )
 
     # Memory
     if 'memory' in resource_data:
@@ -1923,6 +2078,25 @@ def _format_traffic_bytes(bytes_val: Optional[int]) -> str:
     return f"{bytes_val:.1f} PB"
 
 
+def _format_throughput(bytes_per_sec: Optional[float]) -> str:
+    """
+    Format throughput rate to human-readable format.
+
+    Args:
+        bytes_per_sec: Throughput in bytes per second
+
+    Returns:
+        Human-readable rate string (e.g., '125.5 MB/s')
+    """
+    if bytes_per_sec is None:
+        return '-'
+    for unit in ['B/s', 'KB/s', 'MB/s', 'GB/s']:
+        if abs(bytes_per_sec) < 1024.0:
+            return f"{bytes_per_sec:.1f} {unit}"
+        bytes_per_sec /= 1024.0
+    return f"{bytes_per_sec:.1f} TB/s"
+
+
 def _format_runtime(seconds: Optional[int]) -> str:
     """
     Format runtime in seconds to human-readable format.
@@ -1954,7 +2128,7 @@ def create_expanded_pools_view(
     pool_data: Dict[str, Any],
     mode: str,
     scroll_offset: int = 0,
-    page_size: int = 15
+    page_size: int = 20
 ) -> Layout:
     """
     Create a full-screen expanded view of ZFS pools with two sections:
@@ -2041,8 +2215,17 @@ def create_expanded_pools_view(
             else:
                 errors_text = Text("0", style="dim")
 
-            # Format scan status
-            scan = pool.get('scan') or '-'
+            # Format scan status (now a dict with detailed info)
+            scan_info = pool.get('scan')
+            if scan_info and isinstance(scan_info, dict):
+                scan_summary = scan_info.get('summary', '-')
+                # Color based on scan type and status
+                if scan_info.get('status') == 'in_progress':
+                    scan_text = Text(scan_summary, style="yellow")
+                else:
+                    scan_text = Text(scan_summary, style="dim")
+            else:
+                scan_text = Text('-', style="dim")
 
             summary_table.add_row(
                 str(idx),
@@ -2055,7 +2238,7 @@ def create_expanded_pools_view(
                 pool.get('dedup', '-'),
                 health_text,
                 errors_text,
-                scan,
+                scan_text,
             )
 
         summary_panel = Panel(
@@ -2065,7 +2248,57 @@ def create_expanded_pools_view(
             padding=(0, 1)
         )
 
-    # Section 2: Vdev Topology
+    # Section 2 (optional): Scan Progress Details (shows when resilver/scrub in progress)
+    scan_panel = None
+    for pool in pools:
+        scan_info = pool.get('scan')
+        if scan_info and isinstance(scan_info, dict) and scan_info.get('status') == 'in_progress':
+            # Build detailed scan progress display
+            scan_type = scan_info.get('type', 'scan').title()
+            pool_name = pool.get('name', 'unknown')
+
+            # Create a table for scan details
+            scan_table = Table(box=None, padding=(0, 2), expand=True, show_header=False)
+            scan_table.add_column("Label", style="dim", width=16)
+            scan_table.add_column("Value", style="bold")
+            scan_table.add_column("Label2", style="dim", width=16)
+            scan_table.add_column("Value2", style="bold")
+
+            # Row 1: Progress bar and percentage
+            percent = scan_info.get('percent')
+            if percent is not None:
+                # Create visual progress bar
+                bar_width = 30
+                filled = int(bar_width * percent / 100)
+                progress_bar = f"[green]{'█' * filled}[/green][dim]{'░' * (bar_width - filled)}[/dim] {percent:.1f}%"
+            else:
+                progress_bar = "In progress..."
+
+            time_remaining = scan_info.get('time_remaining', '-')
+            scan_table.add_row("Progress:", progress_bar, "Time Remaining:", str(time_remaining))
+
+            # Row 2: Data scanned and issued
+            scanned = scan_info.get('scanned', '-')
+            issued = scan_info.get('issued', '-')
+            scan_table.add_row("Scanned:", str(scanned), "Issued:", str(issued))
+
+            # Row 3: Data resilvered/repaired and start time
+            if scan_info.get('type') == 'resilver':
+                resilvered = scan_info.get('resilvered', '-')
+                scan_table.add_row("Resilvered:", str(resilvered), "Started:", str(scan_info.get('start_time', '-')))
+            else:
+                repaired = scan_info.get('repaired', '-')
+                scan_table.add_row("Repaired:", str(repaired), "Started:", str(scan_info.get('start_time', '-')))
+
+            scan_panel = Panel(
+                scan_table,
+                title=f"[bold yellow]{scan_type} Progress - {pool_name}[/bold yellow]",
+                box=box.ROUNDED,
+                padding=(0, 1)
+            )
+            break  # Only show one scan panel (first pool with active scan)
+
+    # Section 3: Vdev Topology
     topology_content = []
     for pool in pools:
         pool_name = pool.get('name', 'unknown')
@@ -2087,6 +2320,7 @@ def create_expanded_pools_view(
             vdev_state = vdev.get('state', 'UNKNOWN')
             vdev_size = vdev.get('size')
             devices = vdev.get('devices', [])
+            vdev_class = vdev.get('vdev_class', 'data')
 
             # Format vdev state
             if vdev_state == 'ONLINE':
@@ -2105,12 +2339,16 @@ def create_expanded_pools_view(
             # Format size info for vdev
             size_info = f" [dim]{vdev_size}[/dim]" if vdev_size else ""
 
+            # Format vdev class label (data vdevs don't need a label)
+            class_labels = {'logs': 'SLOG', 'cache': 'L2ARC', 'spares': 'SPARE'}
+            class_label = f" [magenta]({class_labels[vdev_class]})[/magenta]" if vdev_class in class_labels else ""
+
             if devices:
                 # This is a vdev group (mirror, raidz, etc.)
                 # Determine vdev type from name (mirror-0, raidz1-0, etc.)
                 vdev_type = vdev_name.split('-')[0] if '-' in vdev_name else vdev_name
                 topology_content.append(Text.from_markup(
-                    f"    ├─ {vdev_name} [bold]{vdev_type.upper()}[/bold]{size_info} [{state_style}]{vdev_state}[/{state_style}]{error_suffix}"
+                    f"    ├─ {vdev_name} [bold]{vdev_type.upper()}[/bold]{class_label}{size_info} [{state_style}]{vdev_state}[/{state_style}]{error_suffix}"
                 ))
                 for i, device in enumerate(devices):
                     dev_name = device.get('name', 'unknown')
@@ -2137,7 +2375,7 @@ def create_expanded_pools_view(
                 # Single disk (no children) - show as DISK type
                 dev_size_info = f" [dim]{vdev_size}[/dim]" if vdev_size else ""
                 topology_content.append(Text.from_markup(
-                    f"    └─ {vdev_name} [bold]DISK[/bold]{dev_size_info} [{state_style}]{vdev_state}[/{state_style}]{error_suffix}"
+                    f"    └─ {vdev_name} [bold]DISK[/bold]{class_label}{dev_size_info} [{state_style}]{vdev_state}[/{state_style}]{error_suffix}"
                 ))
 
         topology_content.append(Text(""))  # Blank line between pools
@@ -2200,11 +2438,18 @@ def create_expanded_pools_view(
         Layout(footer, name="footer", size=3)
     )
 
-    # Split body into two sections (summary on top, topology below)
-    layout["body"].split_column(
-        Layout(summary_panel, name="summary"),
-        Layout(topology_panel, name="topology"),
-    )
+    # Split body into sections (summary, optional scan progress, topology)
+    if scan_panel:
+        layout["body"].split_column(
+            Layout(summary_panel, name="summary", size=6),
+            Layout(scan_panel, name="scan_progress", size=6),
+            Layout(topology_panel, name="topology"),
+        )
+    else:
+        layout["body"].split_column(
+            Layout(summary_panel, name="summary"),
+            Layout(topology_panel, name="topology"),
+        )
 
     return layout
 
@@ -2530,11 +2775,16 @@ def create_expanded_network_view(network_data: Dict[str, Any], mode: str) -> Lay
     """
     layout = Layout()
 
-    # Header
+    # Header with "Since:" timestamp for rate calculation reference
     mode_text = "Local" if mode == 'local' else f"Remote ({SSH_HOST})"
+    rate_since = network_data.get('rate_since')
+    if rate_since:
+        since_str = datetime.fromtimestamp(rate_since).strftime('%H:%M:%S')
+        header_text = f"Network Interfaces - {mode_text} - {datetime.now().strftime('%H:%M:%S')} | Since: {since_str}"
+    else:
+        header_text = f"Network Interfaces - {mode_text} - {datetime.now().strftime('%H:%M:%S')} | Since: -"
     header = Panel(
-        Text(f"Network Interfaces - {mode_text} - {datetime.now().strftime('%H:%M:%S')}",
-             justify="center", style="bold"),
+        Text(header_text, justify="center", style="bold"),
         box=box.ROUNDED
     )
 
@@ -2560,10 +2810,12 @@ def create_expanded_network_view(network_data: Dict[str, Any], mode: str) -> Lay
         table.add_column("MTU", justify="right", width=5)
         table.add_column("IP Addresses", style="green")
 
-        # Traffic stats columns
-        table.add_column("RX", justify="right", width=10)
-        table.add_column("TX", justify="right", width=10)
-        table.add_column("Errors", justify="right", width=8)
+        # Throughput columns with rate and utilization bar
+        table.add_column("RX Rate", justify="right", width=12)
+        table.add_column("RX %", width=20)
+        table.add_column("TX Rate", justify="right", width=12)
+        table.add_column("TX %", width=20)
+        table.add_column("Errors", justify="right", width=6)
 
         for idx, iface in enumerate(interfaces, 1):
             # Format state with color
@@ -2594,6 +2846,26 @@ def create_expanded_network_view(network_data: Dict[str, Any], mode: str) -> Lay
             else:
                 error_text = Text("0", style="dim")
 
+            # Format throughput rates and progress bars
+            rx_rate = iface.get('rx_rate')
+            tx_rate = iface.get('tx_rate')
+            rx_percent = iface.get('rx_percent')
+            tx_percent = iface.get('tx_percent')
+
+            # RX rate and bar
+            rx_rate_str = _format_throughput(rx_rate) if rx_rate is not None else '-'
+            if rx_percent is not None:
+                rx_bar = create_progress_bar(rx_percent, 10)
+            else:
+                rx_bar = Text("-", style="dim")
+
+            # TX rate and bar
+            tx_rate_str = _format_throughput(tx_rate) if tx_rate is not None else '-'
+            if tx_percent is not None:
+                tx_bar = create_progress_bar(tx_percent, 10)
+            else:
+                tx_bar = Text("-", style="dim")
+
             table.add_row(
                 str(idx),
                 iface.get('name', '-'),
@@ -2602,8 +2874,10 @@ def create_expanded_network_view(network_data: Dict[str, Any], mode: str) -> Lay
                 iface.get('mac', '-') or '-',
                 str(iface.get('mtu', '-')) if iface.get('mtu') else '-',
                 ip_display,
-                _format_traffic_bytes(iface.get('rx_bytes')),
-                _format_traffic_bytes(iface.get('tx_bytes')),
+                rx_rate_str,
+                rx_bar,
+                tx_rate_str,
+                tx_bar,
                 error_text,
             )
 
@@ -3141,7 +3415,11 @@ def main():
     def fetch_data():
         """Background thread to fetch data every 5 seconds."""
         nonlocal cached_data
+        prev_network = {}  # Track previous network stats for rate calculation
+        prev_timestamp = None
+        rate_since = None  # Timestamp when rate calculation started
         while fetch_running:
+            current_timestamp = time.time()
             new_data = {
                 'pool': status.get_zpool_status(),
                 'dataset': status.get_dataset_usage(),
@@ -3153,6 +3431,48 @@ def main():
                 'nfs': status.get_nfs_connections(),
                 'nfs_exports': status.get_nfs_exports(),
             }
+
+            # Calculate network throughput rates
+            if prev_timestamp and prev_network:
+                # Record when rate calculation first becomes available
+                if rate_since is None:
+                    rate_since = prev_timestamp
+                time_delta = current_timestamp - prev_timestamp
+                if time_delta > 0:
+                    for iface in new_data['network'].get('interfaces', []):
+                        name = iface.get('name')
+                        if name in prev_network:
+                            prev = prev_network[name]
+                            # Calculate bytes per second
+                            rx_delta = iface.get('rx_bytes', 0) - prev.get('rx_bytes', 0)
+                            tx_delta = iface.get('tx_bytes', 0) - prev.get('tx_bytes', 0)
+                            # Handle counter wrap or reset
+                            if rx_delta < 0:
+                                rx_delta = 0
+                            if tx_delta < 0:
+                                tx_delta = 0
+                            iface['rx_rate'] = rx_delta / time_delta  # bytes/sec
+                            iface['tx_rate'] = tx_delta / time_delta  # bytes/sec
+                            # Calculate percentage of max speed (if speed is known)
+                            speed_mbps = iface.get('speed')
+                            if speed_mbps and speed_mbps > 0:
+                                speed_bps = speed_mbps * 1_000_000 / 8  # Convert Mbps to bytes/sec
+                                iface['rx_percent'] = min(100, (iface['rx_rate'] / speed_bps) * 100)
+                                iface['tx_percent'] = min(100, (iface['tx_rate'] / speed_bps) * 100)
+
+            # Add rate_since timestamp to network data
+            new_data['network']['rate_since'] = rate_since
+
+            # Store current stats for next iteration
+            prev_network = {
+                iface.get('name'): {
+                    'rx_bytes': iface.get('rx_bytes', 0),
+                    'tx_bytes': iface.get('tx_bytes', 0)
+                }
+                for iface in new_data['network'].get('interfaces', [])
+            }
+            prev_timestamp = current_timestamp
+
             with data_lock:
                 cached_data = new_data
             # Sleep in small increments so we can exit quickly
@@ -3223,7 +3543,7 @@ def main():
                         elif current_view == 'pools':
                             # Count topology lines for pools
                             total = _count_pool_topology_lines(current_data.get('pool', {}))
-                            view_page_size = 15
+                            view_page_size = 20
                         else:
                             total = 0
                             view_page_size = page_size
